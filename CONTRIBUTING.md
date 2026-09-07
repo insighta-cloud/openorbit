@@ -44,9 +44,9 @@ identifies a verified `main` commit.
 4. Merge the pull request, then wait for the CI run triggered on `main` to
    pass as well.
 5. Create an annotated `vX.Y.Z` tag at that verified `main` commit, push it,
-   and create the GitHub Release from the matching changelog entry. Run the
-   **Publish Python wheel** workflow to build the frontend-inclusive wheel and
-   publish it to PyPI through Trusted Publishing.
+   and create the GitHub Release from the matching changelog entry. The
+   frontend-inclusive PyPI wheel is published from the
+   `insighta-cloud/openorbit` publishing workflow through Trusted Publishing.
 6. Delete superseded tags only after the new tag and GitHub Release are
    available. Never move or overwrite an existing release tag.
 
@@ -61,5 +61,24 @@ has completed successfully.
   `orbit/resources/prompts/`, and non-secret sample inputs in `orbit/resources/fixtures/`.
 - Commands must be token arrays; do not introduce shell-string execution.
 - Add tests for behavior or schema changes.
+
+## Localization
+
+- Put shared, static UI copy in `frontend/src/locales/index.ts`; do not add new
+  user-facing UI strings inline in a component.
+- Add every new locale key to the English, Korean, and Japanese dictionaries
+  with the same nesting and key name. Group keys by feature rather than adding
+  unrelated keys to an existing group.
+- Use the selected application locale (`orbit.locale`) as the source of truth.
+  `resolveLocale` must continue to fall back to English for an unsupported or
+  missing value.
+- Use `intlLocales` for locale-sensitive date, time, and number formatting.
+- Do not treat runtime content as a locale resource. For example, an AI
+  translation of a runner template or quick start is cached display data;
+  static controls such as **Translate**, **Show original**, and error messages
+  remain locale keys.
+- Translation must not change executable or identity-bearing values: IDs,
+  parameter keys and values, source code, URLs, paths, and API payloads retain
+  their original values.
 
 Contributions are licensed under MIT.
