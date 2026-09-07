@@ -57,11 +57,15 @@ __ORBIT_MANAGER_AI_PROMPT__
 
 Your final response must be exactly one JSON object:
 {
-  \"evaluation\": {\"score\":\"number from 0 to 10\",\"approval\":\"approved|rejected|pending\",\"summary\":\"string\"},
+  \"evaluation\": {\"score\":\"number from 0 to 10\",\"approval\":\"approved|rejected|pending\",\"summary\":\"string\",\"behavior_summary\":\"string, only when the evaluated target is an AI\"},
   \"improvements\": [{\"title\":\"string\",\"status\":\"proposed|adopted|rejected\",\"rationale\":\"string\",\"acceptanceEvidence\":\"string\"}],
   \"reported_issues\": [{\"title\":\"string\",\"severity\":\"low|medium|high|critical\",\"evidence\":\"string\",\"reproduction\":\"string\",\"status\":\"open|acknowledged|resolved\"}]
 }
-Always include both keys, using empty arrays when there are no items."""
+Include behavior_summary only when the evaluated target is an AI. It must describe the AI's observed responses, decisions, tool use, refusals, or other behavior in plain language; do not describe pass/fail outcomes, metrics, baselines, or the evaluator's actions. Omit behavior_summary for non-AI targets. Always include both array keys, using empty arrays when there are no items."""
+PROPOSAL_DECISION_POLICY = """# Improvement decision policy
+Decide each improvement status independently from the evaluation approval score.
+Use `adopted` for a prompt-only change when it is low-risk, additive, reversible through the retained prompt version, directly supported by the observed evidence, and has measurable acceptance evidence. Prefer `adopted` for such changes; do not defer it merely to wait for another iteration or a repeated candidate fingerprint.
+Use `proposed` when the change needs code, infrastructure, product, security, or human-policy approval, or when the evidence is insufficient. Use `rejected` for unsafe, duplicate, or unsupported changes."""
 MANAGER_PROMPT_SLOT = "__ORBIT_MANAGER_AI_PROMPT__"
 NATIVE_IMPROVEMENT_CYCLE_TEMPLATE = r"""# Requirements
 # - PROJECT_ROOT is a Git repository.
@@ -125,6 +129,11 @@ def update_prompt_from_accepted_proposals(ctx, proposals):
         raise ValueError("native improvement cycle requires target_environment.managed_prompt_path")
     target = ctx.project_path(prompt_path)
     current = target.read_text(encoding="utf-8")
+    if not proposals:
+        # Do not manufacture a changing candidate when the supervisor has not
+        # accepted a change. A stable candidate must retain the same fingerprint
+        # across repeated validations before it can be promoted.
+        return {"path": prompt_path, "changed": False, "reason": "no_accepted_proposals"}
     lines = ["## Accepted improvement proposals", "", f"Iteration: {ctx.loop_index}", ""]
     for proposal in proposals:
         lines.extend(
@@ -146,6 +155,19 @@ def update_prompt_from_accepted_proposals(ctx, proposals):
     return ctx.update_file(prompt_path, updated)
 
 
+def managed_prompt_evidence(ctx):
+    '''Expose the current managed prompt beside the browser validation evidence.'''
+    prompt_path = str(ctx.evaluation_build.get("managed_prompt_path") or ctx.evaluation_build.get("prompt_bundle") or "").strip()
+    if not prompt_path:
+        raise ValueError("native improvement cycle requires target_environment.managed_prompt_path")
+    content = ctx.project_path(prompt_path).read_text(encoding="utf-8")
+    return {
+        "path": prompt_path,
+        "sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+        "content": content,
+    }
+
+
 @runner.phase("init")
 def init(ctx):
     # Process-level validation runs once before the iteration loop begins.
@@ -164,6 +186,8 @@ def setup(ctx):
         if isinstance(proposal, dict) and str(proposal.get("status") or "").lower() in {"adopted", "accepted"}
     ]
     prompt_update = update_prompt_from_accepted_proposals(ctx, accepted)
+    accepted_ids = [str(value) for value in feedback.get("_orbit_proposal_ids", [])]
+    proposal_applications = ctx.record_proposal_application(accepted_ids, prompt_update)
     fingerprint, changed = candidate(ctx)
     ctx.emit_result(
         {
@@ -172,6 +196,8 @@ def setup(ctx):
                 "candidate_fingerprint": fingerprint,
                 "changed_paths": changed,
                 "prompt_update": prompt_update,
+                "managed_prompt": managed_prompt_evidence(ctx),
+                "proposal_applications": proposal_applications,
             }
         }
     )
@@ -244,6 +270,84 @@ def teardown(ctx):
 def finalize(ctx):
     # Process-level finalization intentionally leaves the target repository uncommitted.
     ctx.log("Finalized the native improvement cycle without committing changes")
+
+
+if __name__ == "__main__":
+    runner.main()
+"""
+
+SITE_EXPLORATION_TEMPLATE = r"""# Requirements
+# - The target application is running at the evaluation build's browser base URL.
+# - Playwright Chromium and LangGraph are available.
+# This runner follows only same-site links and excludes destructive-looking routes.
+
+import json
+import subprocess
+from pathlib import Path
+from typing import TypedDict
+
+from langgraph.graph import END, START, StateGraph
+
+import orbit_sdk
+from orbit_sdk import runner
+
+
+class ExplorerState(TypedDict, total=False):
+    base_url: str
+    max_clicks: int
+    evidence: dict
+    opinion: str
+
+
+def explore_browser(ctx, state):
+    module = str(Path(orbit_sdk.__file__).resolve().parents[1] / "frontend" / "node_modules" / "playwright")
+    artifacts = ctx.app_data / "artifacts" / ctx.environment.get("ORBIT_RUN_ID", "manual") / f"loop-{ctx.loop_index}"
+    artifacts.mkdir(parents=True, exist_ok=True)
+    payload = {"baseUrl": state["base_url"], "maxClicks": state["max_clicks"], "screenshot": str(artifacts / "site-exploration.png")}
+    script = r'''const { chromium } = require(process.argv[1]); const input = JSON.parse(process.argv[2]);
+const blocked = /(logout|signout|delete|remove|destroy|payment|checkout|purchase|upgrade|unsubscribe)/i;
+(async () => { const browser = await chromium.launch({headless:true}); const page = await browser.newPage(); const visited = []; const origin = new URL(input.baseUrl).origin;
+  try { await page.goto(input.baseUrl, {waitUntil:"domcontentloaded", timeout:30000});
+    for (let step = 0; step <= input.maxClicks; step++) { const text = (await page.locator("body").innerText().catch(() => "")).replace(/\s+/g, " ").slice(0, 1200); visited.push({url:page.url(), title:await page.title(), text});
+      if (step === input.maxClicks) break;
+      const links = await page.locator("a[href]").evaluateAll(items => items.map((item, index) => ({index, href:item.href, text:(item.textContent || "").trim()})).filter(item => item.href));
+      const candidates = links.filter(item => { try { const url = new URL(item.href); return url.origin === origin && !blocked.test(url.pathname + " " + item.text); } catch { return false; } });
+      if (!candidates.length) break; const target = candidates[step % candidates.length]; await page.locator("a[href]").nth(target.index).click({timeout:5000}); await page.waitForLoadState("domcontentloaded", {timeout:10000}).catch(() => {}); await page.waitForTimeout(300);
+    }
+    await page.screenshot({path:input.screenshot, fullPage:true}); console.log(JSON.stringify({visited, screenshot:input.screenshot}));
+  } finally { await browser.close(); } })().catch(error => { console.error(error); process.exit(1); });'''
+    result = subprocess.run(["node", "-e", script, module, json.dumps(payload)], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120)
+    if result.returncode:
+        raise RuntimeError(result.stdout[-4000:] or "Site exploration failed")
+    return json.loads(result.stdout.strip().splitlines()[-1])
+
+
+def form_opinion(state):
+    pages = state["evidence"].get("visited", [])
+    titles = [str(page.get("title") or page.get("url")) for page in pages]
+    return {"opinion": f"Explored {len(pages)} rendered page(s): " + "; ".join(titles[:3]) + ". Review the captured pages for clarity, usefulness, and friction."}
+
+
+def graph(ctx):
+    workflow = StateGraph(ExplorerState)
+    workflow.add_node("explore", lambda state: {"evidence": explore_browser(ctx, state)})
+    workflow.add_node("form_opinion", form_opinion)
+    workflow.add_edge(START, "explore")
+    workflow.add_edge("explore", "form_opinion")
+    workflow.add_edge("form_opinion", END)
+    return workflow.compile()
+
+
+@runner.phase("init")
+def init(ctx):
+    if not ctx.evaluation_build.get("browser_base_url"):
+        raise ValueError("Set a browser base URL before exploring a site")
+
+
+@runner.phase("run")
+def run(ctx):
+    result = graph(ctx).invoke({"base_url": ctx.evaluation_build["browser_base_url"], "max_clicks": 3})
+    ctx.emit_result({"site_exploration": {"opinion": result["opinion"], "evidence": result["evidence"]}})
 
 
 if __name__ == "__main__":
@@ -547,11 +651,11 @@ class ConsoleStore:
             {
                 "id": "user-journey-cycle",
                 "name": "Browser journey validation",
-                "description": "Validates fixed browser journeys directly and retains page evidence and screenshots for every bounded iteration.",
+                "description": "Validates fixed browser journeys and retains page evidence. Requires a running app and Playwright browser.",
                 "source": """# Requirements
 # - The target application is running at the evaluation build's browser base URL.
 # - The evaluation build selects at least one fixed test case.
-# - OpenOrbit's bundled Playwright dependency and browser are available.
+# - Playwright Chromium and its operating-system libraries are available.
 # No external runner script, adapter repository, or background program is required.
 
 import json
@@ -681,6 +785,12 @@ if __name__ == "__main__": runner.main()
         templates.extend(
             (
                 {
+                    "id": "site-exploration",
+                    "name": "Site exploration review",
+                    "description": "Explores safe same-site links through LangGraph and retains rendered evidence for product feedback.",
+                    "source": SITE_EXPLORATION_TEMPLATE,
+                },
+                {
                     "id": "json-agent-cycle",
                     "name": "User journey simulation",
                     "description": "Runs one bounded agent simulation per iteration while OpenOrbit retains fixed inputs, evidence, and supervision.",
@@ -743,7 +853,63 @@ if __name__ == "__main__": runner.main()
                     for parameter in quick_start["parameters"]
                 ],
             }
-        raise ValueError("template translation kind must be runner-template or quick-start")
+        if kind == "supervisor-result":
+            run_id, separator, iteration_value = template_id.partition(":")
+            if not separator or not iteration_value.isdigit():
+                raise ValueError("supervisor result translation ID must be run_id:iteration")
+            record = next(
+                (
+                    item
+                    for item in self._load(run_id).supervisor_results
+                    if isinstance(item, dict) and int(item.get("iteration", 0)) == int(iteration_value)
+                ),
+                None,
+            )
+            response = record.get("response") if isinstance(record, dict) else None
+            if not isinstance(response, dict):
+                raise KeyError(template_id)
+
+            def display_fields(item: Any, fields: tuple[str, ...]) -> dict[str, str]:
+                return {
+                    field: value
+                    for field in fields
+                    if isinstance((value := item.get(field)), str) and value.strip()
+                }
+
+            evaluation = response.get("evaluation")
+            return {
+                **(
+                    {"prompt": record["prompt"]}
+                    if isinstance(record.get("prompt"), str) and record["prompt"].strip()
+                    else {}
+                ),
+                "response": {
+                    "evaluation": display_fields(evaluation, ("behavior_summary", "summary"))
+                    if isinstance(evaluation, dict)
+                    else {},
+                    "improvements": [
+                        display_fields(
+                            item,
+                            (
+                                "title",
+                                "rationale",
+                                "proposed_change",
+                                "acceptanceEvidence",
+                                "validation",
+                                "rollback",
+                            ),
+                        )
+                        for item in response.get("improvements", [])
+                        if isinstance(item, dict)
+                    ],
+                    "reported_issues": [
+                        display_fields(item, ("title", "evidence", "reproduction"))
+                        for item in response.get("reported_issues", [])
+                        if isinstance(item, dict)
+                    ],
+                },
+            }
+        raise ValueError("template translation kind is not supported")
 
     @staticmethod
     def validate_template_translation(source: Any, translated: Any) -> dict[str, Any]:
@@ -828,9 +994,9 @@ if __name__ == "__main__":
             {
                 "schema_version": 1,
                 "id": "openorbit.user-journey-smoke-test",
-                "version": "1.0.0",
+                "version": "1.0.1",
                 "name": "User journey smoke test",
-                "description": "Create a browser-based smoke test for one important user journey.",
+                "description": "Create a browser-based smoke test. Requires a running app and Playwright browser.",
                 "publisher": {"name": "OpenOrbit"},
                 "parameters": [
                     {
@@ -995,10 +1161,145 @@ if __name__ == "__main__":
             },
             {
                 "schema_version": 1,
-                "id": "openorbit.agent-self-improvement",
+                "id": "openorbit.site-exploration-review",
                 "version": "1.0.0",
+                "name": "Site exploration review",
+                "description": "Explore a site through safe links and leave evidence-backed product feedback. Requires a running app, Playwright browser, and LangGraph.",
+                "publisher": {"name": "OpenOrbit"},
+                "parameters": [
+                    {
+                        "key": "build_name",
+                        "label": "Evaluation name",
+                        "type": "string",
+                        "required": True,
+                        "default": "Site exploration review",
+                    },
+                    {
+                        "key": "repository",
+                        "label": "Target repository",
+                        "type": "workspace",
+                        "required": True,
+                        "placeholder": "/absolute/path/to/your-repository",
+                    },
+                    {
+                        "key": "base_url",
+                        "label": "Browser base URL",
+                        "type": "url",
+                        "required": True,
+                        "placeholder": "http://localhost:3000",
+                    },
+                    {
+                        "key": "review_focus",
+                        "label": "Review focus",
+                        "type": "string",
+                        "required": True,
+                        "default": "clarity, usefulness, and friction",
+                        "placeholder": "e.g. first-time visitor experience",
+                    },
+                    {
+                        "key": "profile_name",
+                        "label": "AI model profile name",
+                        "type": "string",
+                        "required": True,
+                        "default": "Site exploration AI",
+                    },
+                    {
+                        "key": "provider",
+                        "label": "AI provider",
+                        "type": "select",
+                        "required": True,
+                        "default": "azure-openai",
+                        "options": [
+                            {"value": "azure-openai", "label": "Azure OpenAI"},
+                            {"value": "aws-bedrock", "label": "AWS Bedrock"},
+                        ],
+                    },
+                    {
+                        "key": "model",
+                        "label": "Model / deployment",
+                        "type": "string",
+                        "required": True,
+                        "placeholder": "e.g. gpt-4o",
+                    },
+                    {
+                        "key": "endpoint",
+                        "label": "Provider endpoint",
+                        "type": "url",
+                        "required": False,
+                        "placeholder": "https://your-resource.openai.azure.com",
+                    },
+                    {
+                        "key": "region",
+                        "label": "Region",
+                        "type": "string",
+                        "required": True,
+                        "default": "us-east-1",
+                    },
+                    {
+                        "key": "secret_env",
+                        "label": "API key environment variable",
+                        "type": "string",
+                        "required": True,
+                        "default": "AZURE_OPENAI_API_KEY",
+                    },
+                ],
+                "assets": {
+                    "runner": {
+                        "name": "${build_name} runner",
+                        "description": "LangGraph site exploration runner created by Quick Start.",
+                        "template_id": "site-exploration",
+                        "source": SITE_EXPLORATION_TEMPLATE,
+                    },
+                    "prompt_template": {
+                        "name": "${build_name} policy",
+                        "version": 1,
+                        "content": "Review the site-exploration evidence for ${review_focus}. Give an evidence-backed product opinion and report reproducible friction or defects only.",
+                    },
+                    "test_case_set": {
+                        "name": "${build_name} exploration",
+                        "description": "Bounded site exploration created by Quick Start.",
+                        "cases": [
+                            {
+                                "id": "site-exploration",
+                                "name": "Explore site",
+                                "path": "/",
+                                "prompt": "Follow safe same-site links.",
+                                "acceptance": "Capture rendered page evidence.",
+                            }
+                        ],
+                    },
+                    "execution_environment": {"name": "${build_name} execution", "executor_type": "local"},
+                    "target_environment": {
+                        "name": "${build_name} target",
+                        "repository": "${repository}",
+                        "browser_base_url": "${base_url}",
+                    },
+                    "model_profile": {
+                        "profile_name": "${profile_name}",
+                        "provider": "${provider}",
+                        "model": "${model}",
+                        "endpoint": "${endpoint}",
+                        "region": "${region}",
+                        "secret_env": "${secret_env}",
+                    },
+                },
+                "build": {
+                    "name": "${build_name}",
+                    "purpose": "Explore a site and assess the rendered experience.",
+                    "model_profile_name": "${profile_name}",
+                    "timezone": "Asia/Tokyo",
+                    "repeat_interval_minutes": 30,
+                    "run_limit": 1,
+                    "approval_score": 8,
+                    "enabled": True,
+                },
+            },
+            {
+                "schema_version": 1,
+                "id": "openorbit.agent-self-improvement",
+                "version": "1.0.2",
                 "name": "Agent self-improvement",
-                "description": "Validate agent or prompt changes against a fixed user journey and retain rollback-ready improvement evidence.",
+                "description": "Improve an agent prompt with browser validation. Requires a Git repository, running app, prompt file, and Playwright browser.",
                 "publisher": {"name": "OpenOrbit"},
                 "parameters": [
                     {
@@ -1027,6 +1328,7 @@ if __name__ == "__main__":
                         "label": "Agent prompt file path",
                         "type": "string",
                         "required": True,
+                        "default": "examples/agent-improvement-sample-prompt.md",
                         "placeholder": "e.g. prompts/system.md",
                     },
                     {
@@ -1126,7 +1428,7 @@ if __name__ == "__main__":
                     "prompt_template": {
                         "name": "${build_name} policy",
                         "version": 1,
-                        "content": "Assess fixed browser evidence and approve improvement proposals only when the evidence supports them.",
+                        "content": "Evaluate the managed agent prompt strictly against the fixed browser evidence. Check scope and task clarity; grounding in observable product evidence; uncertainty and missing-context handling; safety and refusal boundaries; and an actionable next step. For every unmet criterion, return one concrete, non-duplicative prompt improvement with validation and rollback evidence. Never repeat an instruction already present in the managed prompt or its accepted-proposals block. Mark a low-risk, additive, reversible prompt-only improvement adopted whenever it is directly supported by the evidence and has measurable acceptance evidence. Keep code, infrastructure, policy, or insufficiently evidenced changes proposed. Return empty arrays only when every criterion is demonstrably met.",
                     },
                     "test_case_set": {
                         "name": "${build_name} validation",
@@ -1165,6 +1467,142 @@ if __name__ == "__main__":
                     "timezone": "Asia/Tokyo",
                     "repeat_interval_minutes": 30,
                     "run_limit": 3,
+                    "approval_score": 8,
+                    "enabled": True,
+                },
+            },
+            {
+                "schema_version": 1,
+                "id": "openorbit.ai-slo-drift-monitor",
+                "version": "1.0.0",
+                "name": "AI SLO and behavior drift monitor",
+                "description": "Repeatedly assess AI quality, safety, latency, and cost against a fixed baseline. Connects an existing structured AI evaluator; OpenOrbit retains the evidence, supervision, and improvement decisions.",
+                "publisher": {"name": "OpenOrbit"},
+                "parameters": [
+                    {
+                        "key": "build_name",
+                        "label": "Evaluation name",
+                        "type": "string",
+                        "required": True,
+                        "default": "AI operational SLO monitor",
+                    },
+                    {
+                        "key": "repository",
+                        "label": "Evaluator workspace",
+                        "type": "workspace",
+                        "required": True,
+                        "placeholder": "/absolute/path/to/your-ai-evaluator",
+                    },
+                    {
+                        "key": "probe_command",
+                        "label": "Structured evaluator command",
+                        "type": "string",
+                        "required": True,
+                        "placeholder": "e.g. uv run ai-eval",
+                        "description": "A command that supports preflight, prepare, run-probes, and collect-evidence and returns JSON for each action.",
+                    },
+                    {
+                        "key": "slo_focus",
+                        "label": "SLO focus",
+                        "type": "string",
+                        "required": True,
+                        "default": "response quality, policy compliance, latency, and cost",
+                        "placeholder": "e.g. grounded answers and p95 latency under 3 seconds",
+                    },
+                    {
+                        "key": "profile_name",
+                        "label": "AI model profile name",
+                        "type": "string",
+                        "required": True,
+                        "default": "AI operations supervisor",
+                    },
+                    {
+                        "key": "provider",
+                        "label": "AI provider",
+                        "type": "select",
+                        "required": True,
+                        "default": "azure-openai",
+                        "options": [
+                            {"value": "azure-openai", "label": "Azure OpenAI"},
+                            {"value": "aws-bedrock", "label": "AWS Bedrock"},
+                        ],
+                    },
+                    {
+                        "key": "model",
+                        "label": "Model / deployment",
+                        "type": "string",
+                        "required": True,
+                        "placeholder": "e.g. gpt-4o",
+                    },
+                    {
+                        "key": "endpoint",
+                        "label": "Provider endpoint",
+                        "type": "url",
+                        "required": False,
+                        "placeholder": "https://your-resource.openai.azure.com",
+                    },
+                    {
+                        "key": "region",
+                        "label": "Region",
+                        "type": "string",
+                        "required": True,
+                        "default": "us-east-1",
+                    },
+                    {
+                        "key": "secret_env",
+                        "label": "API key environment variable",
+                        "type": "string",
+                        "required": True,
+                        "default": "AZURE_OPENAI_API_KEY",
+                    },
+                ],
+                "assets": {
+                    "runner": {
+                        "name": "${build_name} runner",
+                        "description": "Evidence-gated AI SLO and drift monitor created by Quick Start.",
+                        "template_id": "evidence-gated-probe-cycle",
+                        "source": EVIDENCE_GATED_PROBE_CYCLE_TEMPLATE,
+                    },
+                    "prompt_template": {
+                        "name": "${build_name} policy",
+                        "version": 1,
+                        "content": "Review the fixed AI SLO evidence for ${slo_focus}. Compare each reported metric with its retained baseline and threshold. Report only evidence-backed drift, regressions, or risks; propose reversible improvements with explicit validation and rollback steps.",
+                    },
+                    "test_case_set": {
+                        "name": "${build_name} probe matrix",
+                        "description": "A fixed, repeatable AI operational SLO probe matrix.",
+                        "cases": [
+                            {
+                                "id": "ai-slo-drift",
+                                "name": "AI SLO and behavior drift",
+                                "path": "/",
+                                "prompt": "Evaluate ${slo_focus} against the evaluator's fixed representative input matrix.",
+                                "acceptance": "Return structured current metrics, baseline comparisons, configured thresholds, outliers, and reproducible evidence for every detected drift.",
+                            }
+                        ],
+                    },
+                    "execution_environment": {
+                        "name": "${build_name} execution",
+                        "executor_type": "local",
+                        "environment_variables": {"ORBIT_PROBE_COMMAND": "${probe_command}"},
+                    },
+                    "target_environment": {"name": "${build_name} target", "repository": "${repository}"},
+                    "model_profile": {
+                        "profile_name": "${profile_name}",
+                        "provider": "${provider}",
+                        "model": "${model}",
+                        "endpoint": "${endpoint}",
+                        "region": "${region}",
+                        "secret_env": "${secret_env}",
+                    },
+                },
+                "build": {
+                    "name": "${build_name}",
+                    "purpose": "Continuously monitor AI operational SLOs and behavior drift with retained evidence.",
+                    "model_profile_name": "${profile_name}",
+                    "timezone": "Asia/Tokyo",
+                    "repeat_interval_minutes": 1440,
+                    "run_limit": 30,
                     "approval_score": 8,
                     "enabled": True,
                 },
@@ -1266,6 +1704,7 @@ if __name__ == "__main__":
                 values[key] = str(parameter["default"])
             if parameter.get("required") and not values.get(key):
                 raise ValueError(f"quick start parameter '{key}' is required")
+            values.setdefault(key, "")
         token = uuid.uuid4().hex[:8]
         prefix = re.sub(r"[^a-z0-9]+", "-", quick_start_id.lower()).strip("-")[-36:]
         generated = {
@@ -1565,6 +2004,25 @@ if __name__ == "__main__":
         }
 
     @staticmethod
+    def _environment_variables_from_values(values: dict[str, Any]) -> dict[str, str]:
+        variables = values.get("environment_variables", {})
+        if not isinstance(variables, dict):
+            raise ValueError("execution environment variables must be an object")
+        allowed_orbit_variables = {
+            "ORBIT_ADAPTER_COMMAND",
+            "ORBIT_AGENT_COMMAND",
+            "ORBIT_PROBE_COMMAND",
+        }
+        normalized = {str(key).strip(): str(value) for key, value in variables.items()}
+        if any(
+            not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key)
+            or (key.startswith("ORBIT_") and key not in allowed_orbit_variables)
+            for key in normalized
+        ):
+            raise ValueError("execution environment variables include an unsupported name")
+        return normalized
+
+    @staticmethod
     def _asset_list(path: Path) -> list[dict[str, Any]]:
         if not path.exists():
             return []
@@ -1623,6 +2081,7 @@ if __name__ == "__main__":
             "executor": self._executor_from_values(values),
             "browser_executable_path": str(values.get("browser_executable_path", "")).strip(),
             "browser_library_path": str(values.get("browser_library_path", "")).strip(),
+            "environment_variables": self._environment_variables_from_values(values),
         }
         items.append(item)
         self._save_asset_list(EXECUTION_ENVIRONMENTS, items)
@@ -1654,6 +2113,7 @@ if __name__ == "__main__":
             "executor": self._executor_from_values(values),
             "browser_executable_path": str(values.get("browser_executable_path", "")).strip(),
             "browser_library_path": str(values.get("browser_library_path", "")).strip(),
+            "environment_variables": self._environment_variables_from_values(values),
         }
         items[index] = item
         self._save_asset_list(EXECUTION_ENVIRONMENTS, items)
@@ -1734,7 +2194,18 @@ if __name__ == "__main__":
 
     def prompt_templates(self) -> list[dict[str, Any]]:
         path = CONFIG / "prompt-templates.yaml"
-        return yaml.safe_load(path.read_text(encoding="utf-8")) if path.exists() else []
+        templates = yaml.safe_load(path.read_text(encoding="utf-8")) if path.exists() else []
+        for template in templates:
+            versions = template.get("versions")
+            if not versions:
+                versions = [
+                    {"version": int(template.get("version", 1)), "content": template.get("content", "")}
+                ]
+                template["versions"] = versions
+            latest = max(versions, key=lambda item: int(item.get("version", 0)))
+            template["version"] = int(latest["version"])
+            template["content"] = str(latest["content"])
+        return templates
 
     def target_test_case_sets(self) -> list[dict[str, Any]]:
         return (
@@ -1821,10 +2292,22 @@ if __name__ == "__main__":
         if index is None:
             raise KeyError(template_id)
         name, content = str(values.get("name", "")).strip(), str(values.get("content", "")).strip()
-        version = int(values.get("version", 0))
-        if not name or not content or version < 1:
-            raise ValueError("prompt template requires a name, version, and content")
-        template = {"id": template_id, "name": name, "version": version, "content": content}
+        if not name or not content:
+            raise ValueError("prompt template requires a name and content")
+        current = templates[index]
+        versions = list(
+            current.get("versions")
+            or [{"version": int(current.get("version", 1)), "content": current.get("content", "")}]
+        )
+        version = max(int(item.get("version", 0)) for item in versions) + 1
+        versions.append({"version": version, "content": content})
+        template = {
+            "id": template_id,
+            "name": name,
+            "version": version,
+            "content": content,
+            "versions": versions,
+        }
         templates[index] = template
         temporary = CONFIG / "prompt-templates.tmp"
         temporary.write_text(yaml.safe_dump(templates, allow_unicode=True, sort_keys=False), encoding="utf-8")
@@ -1859,10 +2342,16 @@ if __name__ == "__main__":
         self, templates: list[dict[str, Any]], template_id: str, values: dict[str, Any]
     ) -> dict[str, Any]:
         name, content = str(values.get("name", "")).strip(), str(values.get("content", "")).strip()
-        version = int(values.get("version", 0))
-        if not name or not content or version < 1:
-            raise ValueError("prompt template requires a name, version, and content")
-        template = {"id": template_id, "name": name, "version": version, "content": content}
+        if not name or not content:
+            raise ValueError("prompt template requires a name and content")
+        version = 1
+        template = {
+            "id": template_id,
+            "name": name,
+            "version": version,
+            "content": content,
+            "versions": [{"version": version, "content": content}],
+        }
         templates.append(template)
         temporary = CONFIG / "prompt-templates.tmp"
         temporary.write_text(yaml.safe_dump(templates, allow_unicode=True, sort_keys=False), encoding="utf-8")
@@ -1919,6 +2408,7 @@ if __name__ == "__main__":
                 operational.replace(MANAGER_PROMPT_SLOT, manager_policy),
                 f"# Evaluation context\nRepository: {build.get('repository', '')}\n{legacy_context}",
                 case_text,
+                PROPOSAL_DECISION_POLICY,
             )
             if part
         )
@@ -2417,6 +2907,7 @@ if __name__ == "__main__":
         active_counts = []
         for index in range(bucket_count + 1):
             timestamp = start + interval * index
+            bucket_end = min(end, timestamp + interval)
             count = 0
             for run in pipeline_runs:
                 # Older records can predate finished_at. A terminal status is
@@ -2424,10 +2915,16 @@ if __name__ == "__main__":
                 # active-evaluation graph.
                 if run.status in {"succeeded", "failed", "cancelled"} and run.finished_at is None:
                     continue
-                if run.created_at > timestamp:
+                if index == bucket_count:
+                    if run.created_at > timestamp or (
+                        run.finished_at is not None and run.finished_at <= timestamp
+                    ):
+                        continue
+                elif run.created_at >= bucket_end or (
+                    run.finished_at is not None and run.finished_at <= timestamp
+                ):
                     continue
-                if run.finished_at is None or run.finished_at > timestamp:
-                    count += 1
+                count += 1
             active_counts.append({"time": timestamp.isoformat(), "count": count})
         health_by_build: dict[str, dict[str, Any]] = {}
         for run in pipeline_runs:
@@ -2784,6 +3281,9 @@ if __name__ == "__main__":
             resources["evaluation_build"] = {
                 key: value for key, value in build.items() if key not in {"executor"}
             }
+            resources["execution_environment"] = self._execution_environment(
+                str(build.get("execution_environment_id", ""))
+            )
             selected = next(
                 (
                     item
@@ -2883,6 +3383,8 @@ if __name__ == "__main__":
                 or result.get("jgent_paired")
                 or result.get("agent_cycle")
                 or result.get("probe_gate")
+                or result.get("browser_journey")
+                or result.get("site_exploration")
             )
             if not isinstance(cycle, dict):
                 return False
@@ -2919,8 +3421,13 @@ if __name__ == "__main__":
             raise ValueError("supervisor improvements and reported_issues must be arrays of objects")
         evaluation = result.get("evaluation")
         if evaluation is not None:
-            if not isinstance(evaluation, dict) or set(evaluation) != {"score", "approval", "summary"}:
-                raise ValueError("supervisor evaluation must contain score, approval, and summary")
+            if not isinstance(evaluation, dict) or set(evaluation) not in (
+                {"score", "approval", "summary"},
+                {"score", "approval", "behavior_summary", "summary"},
+            ):
+                raise ValueError(
+                    "supervisor evaluation must contain score, approval, summary, and behavior_summary"
+                )
             score = evaluation["score"]
             if isinstance(score, str):
                 try:
@@ -2935,6 +3442,8 @@ if __name__ == "__main__":
                 evaluation["summary"], str
             ):
                 raise ValueError("supervisor evaluation approval or summary is invalid")
+            if "behavior_summary" in evaluation and not isinstance(evaluation["behavior_summary"], str):
+                raise ValueError("supervisor evaluation behavior_summary is invalid")
         return result
 
     def _complete_supervision(self, run_id: str) -> None:
@@ -3182,6 +3691,17 @@ if __name__ == "__main__":
                 self._wait_for_tool_interval(step.id, step.minimum_interval_seconds)
                 creation_flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
                 environment = os.environ.copy()
+                execution_environment = (resources or {}).get("execution_environment", {})
+                if isinstance(execution_environment, dict):
+                    configured_variables = execution_environment.get("environment_variables", {})
+                    if isinstance(configured_variables, dict):
+                        environment.update(
+                            {
+                                str(key): str(value)
+                                for key, value in configured_variables.items()
+                                if str(key).strip()
+                            }
+                        )
                 environment["PYTHONPATH"] = str(ROOT / "backend") + (
                     os.pathsep + environment["PYTHONPATH"] if environment.get("PYTHONPATH") else ""
                 )

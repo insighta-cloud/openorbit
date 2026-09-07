@@ -216,6 +216,17 @@ def test_native_improvement_cycle_evidence_triggers_supervision():
     assert store_module.ConsoleStore._latest_cycle_has_persona_evidence(RunRecord()) is True
 
 
+def test_direct_browser_and_site_exploration_evidence_trigger_supervision():
+    class BrowserRun:
+        step_results = [{"phase": "run", "result": {"browser_journey": {"results": [{"passed": True}]}}}]
+
+    class SiteRun:
+        step_results = [{"phase": "run", "result": {"site_exploration": {"evidence": {"visited": [{}]}}}}]
+
+    assert store_module.ConsoleStore._latest_cycle_has_persona_evidence(BrowserRun()) is True
+    assert store_module.ConsoleStore._latest_cycle_has_persona_evidence(SiteRun()) is True
+
+
 def test_runner_templates_separate_direct_user_journeys_from_external_commands():
     templates = {item["id"]: item for item in store_module.ConsoleStore.runner_templates()}
     user_journey = templates["user-journey-cycle"]["source"]
@@ -239,12 +250,70 @@ def test_runner_templates_separate_direct_user_journeys_from_external_commands()
     assert "update_prompt_from_accepted_proposals" in improvement
     assert "ctx.accept_proposal" not in improvement
     assert "ctx.update_file" in improvement
+    assert "managed_prompt_evidence" in improvement
+    assert "record_proposal_application" in improvement
+    assert "no_accepted_proposals" in improvement
     assert "ORBIT_AGENT_COMMAND" in json_agent
     assert "ORBIT_PROBE_COMMAND" in probe_gate
     assert "Insighta" not in json_agent
     assert "Jgent" not in json_agent
     assert "Insighta" not in probe_gate
     assert "Jgent" not in probe_gate
+
+
+def test_site_exploration_quick_start_uses_the_langgraph_runner():
+    store = store_module.ConsoleStore()
+    quick_start = next(
+        item for item in store._built_in_quick_starts() if item["id"] == "openorbit.site-exploration-review"
+    )
+    runner = quick_start["assets"]["runner"]
+    assert "LangGraph" in quick_start["description"]
+    assert runner["template_id"] == "site-exploration"
+    assert "StateGraph" in runner["source"]
+    assert "logout|signout|delete" in runner["source"]
+
+
+def test_ai_slo_drift_quick_start_uses_a_recurring_evidence_gate():
+    store = store_module.ConsoleStore()
+    quick_start = next(
+        item for item in store._built_in_quick_starts() if item["id"] == "openorbit.ai-slo-drift-monitor"
+    )
+    runner = quick_start["assets"]["runner"]
+    execution = quick_start["assets"]["execution_environment"]
+
+    assert quick_start["build"]["repeat_interval_minutes"] == 1440
+    assert quick_start["build"]["run_limit"] == 30
+    assert runner["template_id"] == "evidence-gated-probe-cycle"
+    assert "playwright" not in runner["source"].lower()
+    assert execution["environment_variables"] == {"ORBIT_PROBE_COMMAND": "${probe_command}"}
+    assert "baseline" in quick_start["assets"]["prompt_template"]["content"]
+
+
+def test_ai_slo_drift_quick_start_persists_its_evaluator_command(tmp_path, monkeypatch):
+    monkeypatch.setattr(store_module, "CONFIG", tmp_path)
+    monkeypatch.setattr(store_module, "SETTINGS", tmp_path / "settings.json")
+    monkeypatch.setattr(store_module, "RUNNERS", tmp_path / "runners")
+    monkeypatch.setattr(store_module, "RUNNER_TEMPLATES", tmp_path / "runner-templates")
+    monkeypatch.setattr(store_module, "QUICK_STARTS", tmp_path / "quick-starts")
+    monkeypatch.setattr(store_module, "QUICK_START_INSTANCES", tmp_path / "quick-start-instances.yaml")
+    monkeypatch.setattr(store_module, "EXECUTION_ENVIRONMENTS", tmp_path / "execution-environments.yaml")
+    monkeypatch.setattr(store_module, "TARGET_ENVIRONMENTS", tmp_path / "target-environments.yaml")
+    monkeypatch.setattr(store_module, "TARGET_TEST_CASE_SETS", tmp_path / "target-test-case-sets.yaml")
+    store = store_module.ConsoleStore()
+
+    created = store.instantiate_quick_start(
+        "openorbit.ai-slo-drift-monitor",
+        {
+            "repository": str(tmp_path),
+            "probe_command": "uv run ai-eval",
+            "model": "gpt-4o",
+        },
+    )
+
+    execution = store._execution_environment(created["generated"]["execution_environment_id"])
+    assert execution["environment_variables"] == {"ORBIT_PROBE_COMMAND": "uv run ai-eval"}
+    assert created["build"]["repeat_interval_minutes"] == 1440
+    assert store.profiles()[-1]["endpoint"] == ""
 
 
 def test_runner_templates_can_be_imported_into_app_data(tmp_path, monkeypatch):
@@ -272,7 +341,13 @@ def test_manager_prompt_template_can_be_updated(tmp_path, monkeypatch):
     template = store_module.ConsoleStore().update_prompt_template(
         "manager-test-v1", {"name": "Updated", "version": 2, "content": "new content"}
     )
-    assert template == {"id": "manager-test-v1", "name": "Updated", "version": 2, "content": "new content"}
+    assert template == {
+        "id": "manager-test-v1",
+        "name": "Updated",
+        "version": 2,
+        "content": "new content",
+        "versions": [{"version": 1, "content": "old"}, {"version": 2, "content": "new content"}],
+    }
 
 
 def test_target_test_case_sets_are_managed_as_assets(tmp_path, monkeypatch):
