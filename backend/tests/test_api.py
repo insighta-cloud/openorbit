@@ -1,11 +1,14 @@
 import base64
 import json
+import sys
 
+import orbit_sdk as sdk
 import pytest
+from app import main as main_module
 from app import providers
 from app import store as store_module
 from app.main import app
-from app.models import Run
+from app.models import Run, Step, Workflow
 from fastapi.testclient import TestClient
 from orbit_sdk import RunnerContext
 
@@ -14,6 +17,18 @@ def test_health_is_available():
     response = TestClient(app).get("/api/health")
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
+
+
+def test_generated_sdk_docs_are_served_from_the_local_app(tmp_path, monkeypatch):
+    docs = tmp_path / "site" / "sdk"
+    docs.mkdir(parents=True)
+    (docs / "index.html").write_text("<h1>SDK reference</h1>", encoding="utf-8")
+    monkeypatch.setattr(main_module, "SDK_DOCS_DIST", docs.parent)
+
+    response = TestClient(app).get("/sdk-docs/sdk/")
+
+    assert response.status_code == 200
+    assert "SDK reference" in response.text
 
 
 def test_cancelling_a_waiting_run_clears_its_current_phase(tmp_path, monkeypatch):
@@ -38,6 +53,419 @@ def test_cancelling_a_waiting_run_clears_its_current_phase(tmp_path, monkeypatch
     assert cancelled.status == "cancelled"
     assert cancelled.current_step is None
     assert cancelled.current_phase is None
+
+
+def test_runner_target_logs_are_retained_separately_from_runner_output(tmp_path, monkeypatch):
+    monkeypatch.setattr(store_module, "RUNS", tmp_path / "runs")
+    project = tmp_path / "target"
+    project.mkdir()
+    runner = project / "runner.py"
+    runner.write_text(
+        "from orbit_sdk import runner\n"
+        "@runner.phase('run')\n"
+        "def run(ctx):\n"
+        "    ctx.target_log('service started', source='target-api')\n"
+        "    ctx.target_log('slow response', level='warn', source='target-api')\n"
+        "if __name__ == '__main__': runner.main()\n",
+        encoding="utf-8",
+    )
+    timestamp = store_module.now()
+    store = store_module.ConsoleStore()
+    store._save(
+        Run(
+            id="target-log-run",
+            workflow_id="workflow",
+            workflow_name="Workflow",
+            repository=str(project),
+            status="running",
+            created_at=timestamp,
+            updated_at=timestamp,
+        )
+    )
+
+    store._execute_step(
+        "target-log-run",
+        Step(
+            id="run",
+            phase="run",
+            name="Run",
+            command=[sys.executable, str(runner), "--phase", "run"],
+            working_directory=str(project),
+        ),
+        loop_index=3,
+    )
+
+    step = store._load("target-log-run").step_results[-1]
+    assert "target_logs" not in (step.get("result") or {})
+    assert step["output"] == ""
+    assert [(entry["level"], entry["source"], entry["message"]) for entry in step["target_logs"]] == [
+        ("info", "target-api", "service started"),
+        ("warn", "target-api", "slow response"),
+    ]
+    assert all(entry["run_id"] == "target-log-run" for entry in step["target_logs"])
+    assert all(entry["iteration"] == 3 and entry["phase"] == "run" for entry in step["target_logs"])
+
+
+def test_runner_data_files_are_retained_for_the_iteration(tmp_path, monkeypatch):
+    app_data = tmp_path / "orbit-data"
+    monkeypatch.setattr(store_module, "APP_DATA", app_data)
+    monkeypatch.setattr(store_module, "RUNS", app_data / "data" / "runs")
+    project = tmp_path / "target"
+    project.mkdir()
+    runner = project / "runner.py"
+    runner.write_text(
+        "from orbit_sdk import runner\n"
+        "@runner.phase('run')\n"
+        "def run(ctx):\n"
+        "    ctx.save_data_file('evidence/first.json', '{}', label='First result')\n"
+        "    ctx.save_data_file('evidence/second.json', '{}', label='Second result')\n"
+        "if __name__ == '__main__': runner.main()\n",
+        encoding="utf-8",
+    )
+    timestamp = store_module.now()
+    store = store_module.ConsoleStore()
+    store._save(
+        Run(
+            id="data-file-run",
+            workflow_id="workflow",
+            workflow_name="Workflow",
+            repository=str(project),
+            status="running",
+            created_at=timestamp,
+            updated_at=timestamp,
+        )
+    )
+
+    store._execute_step(
+        "data-file-run",
+        Step(
+            id="run",
+            phase="run",
+            name="Run",
+            command=[sys.executable, str(runner), "--phase", "run"],
+            working_directory=str(project),
+        ),
+        loop_index=3,
+    )
+
+    files = store._load("data-file-run").step_results[-1]["data_files"]
+    assert [(item["label"], item["filename"]) for item in files] == [
+        ("First result", "first.json"),
+        ("Second result", "second.json"),
+    ]
+    assert all(item["path"].startswith(str(app_data)) for item in files)
+
+
+def test_prompt_revisions_returns_immutable_prompt_diff(tmp_path, monkeypatch):
+    app_data = tmp_path / "orbit-data"
+    project = tmp_path / "project"
+    project.mkdir()
+    prompt = project / "prompt.md"
+    prompt.write_text("before\n", encoding="utf-8")
+    monkeypatch.setattr(store_module, "APP_DATA", app_data)
+    monkeypatch.setattr(store_module, "RUNS", app_data / "data" / "runs")
+    monkeypatch.setattr(sdk, "ORBIT_APP_DATA", app_data)
+    resources = base64.b64encode(
+        json.dumps({"evaluation_build": {"managed_prompt_path": "prompt.md"}}).encode()
+    ).decode()
+    update = RunnerContext(
+        phase="setup",
+        target_repository=project,
+        mode="run",
+        loop_index=1,
+        environment={"ORBIT_RUN_ID": "prompt-run", "ORBIT_RUNNER_RESOURCES": resources},
+    ).update_file("prompt.md", "after\n")
+    timestamp = store_module.now()
+    store = store_module.ConsoleStore()
+    store._save(
+        Run(
+            id="prompt-run",
+            workflow_id="workflow",
+            workflow_name="Workflow",
+            repository=str(project),
+            status="succeeded",
+            created_at=timestamp,
+            updated_at=timestamp,
+            step_results=[
+                {
+                    "phase": "setup",
+                    "loop_index": 1,
+                    "ended_at": timestamp.isoformat(),
+                    "result": {"file_update": update},
+                },
+                {
+                    "phase": "setup",
+                    "loop_index": 2,
+                    "ended_at": timestamp.isoformat(),
+                    "result": {
+                        "file_update_blocked": {
+                            "path": "prompt.md",
+                            "reason": "awaiting_human_approval",
+                        }
+                    },
+                },
+            ],
+        )
+    )
+
+    revisions = store.prompt_revisions("prompt-run")
+
+    assert revisions[0]["status"] == "initial"
+    assert revisions[0]["after"] == "before\n"
+    assert revisions[1]["status"] == "applied"
+    assert revisions[1]["before"] == "before\n"
+    assert revisions[1]["after"] == "after\n"
+    assert revisions[2]["status"] == "blocked"
+    assert revisions[2]["before"] == "after\n"
+    assert revisions[2]["after"] == "after\n"
+
+
+def test_commit_changes_returns_sdk_commit_range(tmp_path, monkeypatch):
+    monkeypatch.setattr(store_module, "RUNS", tmp_path / "runs")
+    store = store_module.ConsoleStore()
+    timestamp = store_module.now()
+    store._save(
+        Run(
+            id="commit-run",
+            workflow_id="workflow",
+            workflow_name="Workflow",
+            status="succeeded",
+            created_at=timestamp,
+            updated_at=timestamp,
+            step_results=[
+                {
+                    "phase": "run",
+                    "loop_index": 2,
+                    "ended_at": timestamp.isoformat(),
+                    "result": {
+                        "commit_change": {
+                            "before": "a" * 40,
+                            "after": "b" * 40,
+                            "changed_paths": ["src/agent.py"],
+                            "commits": [{"sha": "b" * 40, "subject": "Improve agent"}],
+                            "diff_artifact": {"relative_path": "commits/a..b.patch"},
+                        }
+                    },
+                }
+            ],
+        )
+    )
+
+    changes = store.commit_changes("commit-run")
+
+    assert changes[0]["before"] == "a" * 40
+    assert changes[0]["commits"][0]["subject"] == "Improve agent"
+    assert changes[0]["changed_paths"] == ["src/agent.py"]
+
+
+def test_commit_changes_includes_jgent_committed_source_candidate(tmp_path, monkeypatch):
+    monkeypatch.setattr(store_module, "RUNS", tmp_path / "runs")
+    store = store_module.ConsoleStore()
+    timestamp = store_module.now()
+    store._save(
+        Run(
+            id="jgent-commit-run",
+            workflow_id="workflow",
+            workflow_name="Jgent",
+            status="succeeded",
+            created_at=timestamp,
+            updated_at=timestamp,
+            step_results=[
+                {
+                    "phase": "setup",
+                    "loop_index": 1,
+                    "ended_at": timestamp.isoformat(),
+                    "result": {
+                        "jgent_paired": {
+                            "committed_source_candidate": {
+                                "status": "committed_source_candidate",
+                                "before": "a" * 40,
+                                "after": "b" * 40,
+                                "changed_paths": ["src/Jgent/Agent.cs"],
+                                "commits": [{"sha": "b" * 40, "subject": "Improve Jgent"}],
+                            }
+                        }
+                    },
+                }
+            ],
+        )
+    )
+
+    changes = store.commit_changes("jgent-commit-run")
+
+    assert changes[0]["changed_paths"] == ["src/Jgent/Agent.cs"]
+    assert changes[0]["commits"][0]["subject"] == "Improve Jgent"
+
+
+@pytest.mark.parametrize("terminal_status", ["failed", "cancelled"])
+def test_teardown_runs_after_a_failed_or_cancelled_iteration(tmp_path, monkeypatch, terminal_status):
+    monkeypatch.setattr(store_module, "RUNS", tmp_path / "runs")
+    store = store_module.ConsoleStore()
+    timestamp = store_module.now()
+    run = Run(
+        id=f"cleanup-{terminal_status}",
+        workflow_id="cleanup-workflow",
+        workflow_name="Cleanup workflow",
+        execution_mode="test",
+        status="queued",
+        created_at=timestamp,
+        updated_at=timestamp,
+    )
+    store._save(run)
+    workflow = Workflow(
+        id="cleanup-workflow",
+        name="Cleanup workflow",
+        description="",
+        kind="simulation",
+        risk="low",
+        steps=[
+            Step(id="setup", phase="setup", name="Setup", command=[], working_directory="."),
+            Step(id="teardown", phase="teardown", name="Teardown", command=[], working_directory="."),
+        ],
+    )
+    monkeypatch.setattr(store, "_runner_execution_plan", lambda _: workflow)
+    calls = []
+
+    def execute_step(run_id, step, loop_index=1, resources=None, *, allow_terminal=False):
+        calls.append((step.phase, loop_index, allow_terminal))
+        if step.phase == "setup":
+            current = store._load(run_id)
+            current.status = terminal_status
+            store._save(current)
+
+    monkeypatch.setattr(store, "_execute_step", execute_step)
+
+    store._execute(run.id)
+
+    assert calls == [("setup", 1, False), ("teardown", 1, True)]
+
+
+@pytest.mark.parametrize("terminal_status", ["failed", "cancelled"])
+def test_finalize_runs_after_a_terminal_iteration_for_repository_recovery(
+    tmp_path, monkeypatch, terminal_status
+):
+    monkeypatch.setattr(store_module, "RUNS", tmp_path / "runs")
+    store = store_module.ConsoleStore()
+    timestamp = store_module.now()
+    run = Run(
+        id=f"finalize-{terminal_status}",
+        workflow_id="recovery-workflow",
+        workflow_name="Recovery workflow",
+        execution_mode="test",
+        status="queued",
+        created_at=timestamp,
+        updated_at=timestamp,
+    )
+    store._save(run)
+    workflow = Workflow(
+        id="recovery-workflow",
+        name="Recovery workflow",
+        description="",
+        kind="simulation",
+        risk="low",
+        steps=[
+            Step(id="setup", phase="setup", name="Setup", command=[], working_directory="."),
+            Step(id="finalize", phase="finalize", name="Finalize", command=[], working_directory="."),
+        ],
+    )
+    monkeypatch.setattr(store, "_runner_execution_plan", lambda _: workflow)
+    calls = []
+
+    def execute_step(run_id, step, loop_index=1, resources=None, *, allow_terminal=False):
+        calls.append((step.phase, loop_index, allow_terminal))
+        if step.phase == "setup":
+            current = store._load(run_id)
+            current.status = terminal_status
+            store._save(current)
+
+    monkeypatch.setattr(store, "_execute_step", execute_step)
+
+    store._execute(run.id)
+
+    assert calls == [("setup", 1, False), ("finalize", 2, True)]
+
+
+def test_native_improvement_template_uses_repository_snapshot_lifecycle():
+    source = store_module.NATIVE_IMPROVEMENT_CYCLE_TEMPLATE
+
+    assert "ctx.save_setup_snapshot()" in source
+    assert "ctx.save_first_teardown_snapshot()" in source
+    assert "ctx.restore_setup_snapshot()" in source
+
+
+def test_score_select_retains_candidates_and_selects_highest_supervisor_score(tmp_path, monkeypatch):
+    monkeypatch.setattr(store_module, "RUNS", tmp_path / "runs")
+    store = store_module.ConsoleStore()
+    timestamp = store_module.now()
+    run = Run(
+        id="score-select",
+        workflow_id="workflow",
+        workflow_name="Workflow",
+        execution_mode="run",
+        status="queued",
+        created_at=timestamp,
+        updated_at=timestamp,
+        loop_limit=2,
+        iteration_strategy="score_select",
+        candidates_per_iteration=2,
+    )
+    store._save(run)
+    workflow = Workflow(
+        id="workflow",
+        name="Workflow",
+        description="",
+        kind="simulation",
+        risk="low",
+        steps=[Step(id="run", phase="run", name="Run", command=[], working_directory=".")],
+    )
+    monkeypatch.setattr(store, "_runner_execution_plan", lambda _: workflow)
+    calls = []
+
+    def execute_step(
+        run_id,
+        step,
+        loop_index=1,
+        resources=None,
+        *,
+        allow_terminal=False,
+        candidate_id=None,
+        base_candidate_id=None,
+    ):
+        calls.append((step.id, loop_index, candidate_id, base_candidate_id, allow_terminal))
+        current = store._load(run_id)
+        current.step_results.append(
+            {"phase": step.phase, "loop_index": loop_index, "candidate_id": candidate_id}
+        )
+        store._save(current)
+
+    def supervise(run_id):
+        current = store._load(run_id)
+        candidate_id = current.step_results[-1]["candidate_id"]
+        score = 9 if candidate_id == "2-2" else 7
+        current.supervisor_results.append(
+            {
+                "iteration": int(candidate_id.split("-")[0]),
+                "candidate_id": candidate_id,
+                "status": "completed",
+                "response": {"evaluation": {"score": score}, "improvements": [], "reported_issues": []},
+            }
+        )
+        store._save(current)
+
+    monkeypatch.setattr(store, "_execute_step", execute_step)
+    monkeypatch.setattr(store, "_complete_supervision", supervise)
+    store._execute(run.id)
+    completed = store._load(run.id)
+    assert [(item["id"], item["selected"]) for item in completed.iteration_candidates] == [
+        ("1", True),
+        ("2-1", False),
+        ("2-2", True),
+    ]
+    assert calls == [
+        ("run", 1, "1", None, False),
+        ("run", 2, "2-1", "1", False),
+        ("run", 2, "2-2", "1", False),
+    ]
 
 
 def test_deleting_a_completed_run_removes_its_history(tmp_path, monkeypatch):
@@ -164,6 +592,7 @@ def test_v1_openapi_contract_covers_control_room_assets_and_observability():
         "/api/v1/dashboard",
         "/api/v1/logs",
         "/api/v1/improvements/analytics",
+        "/api/v1/improvements/iterations",
         "/api/v1/improvements/proposals",
         "/api/v1/template-translations",
     }
@@ -241,6 +670,28 @@ def test_supervisor_result_normalizes_a_numeric_string_score():
         '{"evaluation":{"score":"8","approval":"pending","summary":"ok"},"improvements":[],"reported_issues":[]}'
     )
     assert result["evaluation"]["score"] == 8.0
+
+
+def test_supervisor_result_accepts_a_structured_ai_behavior_trace():
+    result = store_module.ConsoleStore._validated_supervisor_result(
+        '{"evaluation":{"score":8,"approval":"pending","summary":"ok","behavior_trace":'
+        '{"purpose":"Verify recovery","rationale":"The prior attempt timed out","observation":"A retry completed",'
+        '"decision":"The AI retried safely","next_action":"Check the resulting output"}},'
+        '"improvements":[],"reported_issues":[]}'
+    )
+    assert result["evaluation"]["behavior_trace"]["purpose"] == "Verify recovery"
+
+
+def test_supervisor_result_rejects_an_incomplete_behavior_trace():
+    try:
+        store_module.ConsoleStore._validated_supervisor_result(
+            '{"evaluation":{"score":8,"approval":"pending","summary":"ok",'
+            '"behavior_trace":{"purpose":"Only one field"}},"improvements":[],"reported_issues":[]}'
+        )
+    except ValueError as error:
+        assert "behavior_trace" in str(error)
+    else:
+        raise AssertionError("incomplete behavior trace was accepted")
 
 
 def test_native_improvement_cycle_evidence_triggers_supervision():
@@ -524,6 +975,19 @@ def test_proposal_history_is_derived_from_evaluation_run_results(tmp_path, monke
             status="succeeded",
             created_at=timestamp,
             updated_at=timestamp,
+            step_results=[
+                {
+                    "loop_index": 2,
+                    "data_files": [
+                        {
+                            "label": "Iteration evidence",
+                            "filename": "evidence.json",
+                            "path": "/tmp/orbit/evidence.json",
+                            "relative_path": "evidence.json",
+                        }
+                    ],
+                }
+            ],
             supervisor_results=[
                 {
                     "iteration": 2,
@@ -542,6 +1006,31 @@ def test_proposal_history_is_derived_from_evaluation_run_results(tmp_path, monke
     lifecycle = store.proposal_lifecycles("build-1")
     assert [item["status"] for item in lifecycle] == ["accepted", "proposed"]
     assert {item["title"] for item in lifecycle} == {"Keep evidence", "Remove noise"}
+    assert lifecycle[0]["data_files"] == [
+        {
+            "label": "Iteration evidence",
+            "filename": "evidence.json",
+            "path": "/tmp/orbit/evidence.json",
+            "relative_path": "evidence.json",
+        }
+    ]
+    assert store.improvement_iteration_data("build-1") == [
+        {
+            "evaluation_build_id": "build-1",
+            "evaluation_build_name": "Build 1",
+            "run_id": "run-1",
+            "iteration": 2,
+            "recorded_at": timestamp.isoformat(),
+            "data_files": [
+                {
+                    "label": "Iteration evidence",
+                    "filename": "evidence.json",
+                    "path": "/tmp/orbit/evidence.json",
+                    "relative_path": "evidence.json",
+                }
+            ],
+        }
+    ]
 
 
 def test_hello_accepts_unsaved_profile_settings():
@@ -579,10 +1068,22 @@ def test_settings_save_and_select_multiple_profiles(tmp_path, monkeypatch):
 def test_application_manager_prompt_is_separate_from_model_profiles(tmp_path, monkeypatch):
     monkeypatch.setattr(store_module, "SETTINGS", tmp_path / "settings.json")
     store = store_module.ConsoleStore()
-    expected_prompt = f"Operate with audit context.\n\n{store_module.MANAGER_PROMPT_SLOT}"
+    expected_prompt = (
+        f"Operate with audit context.\n\n{store_module.MANAGER_PROMPT_SLOT}\n\n"
+        f"{store_module.MANAGER_OUTPUT_LANGUAGE_SLOT}"
+    )
     assert store.save_application_settings({"manager_prompt_template": "Operate with audit context."}) == {
         "manager_prompt_template": expected_prompt,
+        "manager_output_locale": "en",
         "chat_model_profile_name": "",
+        "assistant_tools": {
+            "workspace_root": str(store_module.ROOT),
+            "file_read_enabled": True,
+            "file_search_enabled": True,
+            "run_process_enabled": True,
+            "terminal_enabled": True,
+            "terminal_visible": True,
+        },
     }
     store.save_settings(
         {
@@ -621,3 +1122,47 @@ def test_application_manager_prompt_has_a_safe_default(tmp_path, monkeypatch):
         "approval-first operations manager"
         in store_module.ConsoleStore().application_settings()["manager_prompt_template"]
     )
+
+
+def test_exact_legacy_manager_prompt_is_migrated_but_custom_prompt_is_preserved(tmp_path, monkeypatch):
+    monkeypatch.setattr(store_module, "SETTINGS", tmp_path / "settings.json")
+    (tmp_path / "settings.json").write_text(
+        json.dumps(
+            {
+                "application_settings": {
+                    "manager_prompt_template": store_module.LEGACY_OPERATIONAL_MANAGER_PROMPT
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert (
+        store_module.ConsoleStore().application_settings()["manager_prompt_template"]
+        == store_module.DEFAULT_OPERATIONAL_MANAGER_PROMPT
+    )
+    (tmp_path / "settings.json").write_text(
+        json.dumps(
+            {"application_settings": {"manager_prompt_template": "Custom\n__ORBIT_MANAGER_AI_PROMPT__"}}
+        ),
+        encoding="utf-8",
+    )
+    assert (
+        store_module.ConsoleStore()
+        .application_settings()["manager_prompt_template"]
+        .startswith("Custom\n__ORBIT_MANAGER_AI_PROMPT__")
+    )
+
+
+def test_manager_output_language_is_injected_into_the_assembled_prompt(tmp_path, monkeypatch):
+    monkeypatch.setattr(store_module, "SETTINGS", tmp_path / "settings.json")
+    monkeypatch.setattr(store_module, "CONFIG", tmp_path / "config")
+    store = store_module.ConsoleStore()
+    store.save_application_settings({"manager_output_locale": "ja"})
+    (tmp_path / "config").mkdir(exist_ok=True)
+    (tmp_path / "config" / "prompt-templates.yaml").write_text(
+        "- id: manager-default-v1\n  name: Default\n  version: 1\n  content: Assess evidence.\n",
+        encoding="utf-8",
+    )
+    _, prompt = store._assembled_prompt({"manager_template_id": "manager-default-v1", "repository": "test"})
+    assert "configured application language (ja)" in prompt
+    assert store_module.MANAGER_OUTPUT_LANGUAGE_SLOT not in prompt
