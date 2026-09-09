@@ -102,6 +102,13 @@ export default function App() {
         room.refresh();
       })
       .catch((e) => room.setNotice(e.message));
+  const retryRun = (id: string, restartFromFirst: boolean) =>
+    api(`/api/runs/${id}/retry`, "POST", { restart_from_first: restartFromFirst })
+      .then(() => {
+        room.setNotice("Evaluation retry started.", "warning");
+        room.refresh();
+      })
+      .catch((e) => room.setNotice(e.message));
   const deleteRuns = (ids: string[]) =>
     Promise.all(
       ids.map((id) => api(`/api/runs/${encodeURIComponent(id)}`, "DELETE")),
@@ -132,14 +139,9 @@ export default function App() {
       })
       .catch((e) => room.setNotice(e.message));
   const save = () => {
-    if (!room.settingsTested) {
-      const error = new Error("Test the configuration before saving.");
-      room.setNotice(error.message, "warning");
-      return Promise.reject(error);
-    }
     return api("/api/settings", "PUT", room.settings).then(() => {
       room.setSettingsTested(false);
-      room.setNotice("AI settings saved", "success");
+      room.setNotice(ui.aiSettingsSaved, "success");
       return room.refresh();
     });
   };
@@ -182,7 +184,7 @@ export default function App() {
   const updateBuild = (id: string, values: unknown) =>
     api(`/api/evaluation-builds/${id}`, "PUT", values)
       .then(() => {
-        room.setNotice("Evaluation build updated", "success");
+        room.setNotice(ui.evaluationBuildUpdated, "success");
         room.refresh();
       })
       .catch((e) => room.setNotice(e.message));
@@ -208,7 +210,7 @@ export default function App() {
     }[kind];
     api(path, "DELETE")
       .then(() => {
-        room.setNotice("Asset deleted", "success");
+        room.setNotice(ui.assetDeleted, "success");
         room.refresh();
       })
       .catch((e) => room.setNotice(e.message));
@@ -220,7 +222,7 @@ export default function App() {
     setDeletingBuild(null);
     api(`/api/evaluation-builds/${id}`, "DELETE")
       .then(() => {
-        room.setNotice("Evaluation build deleted", "success");
+        room.setNotice(ui.evaluationBuildDeleted, "success");
         room.refresh();
       })
       .catch((e) => room.setNotice(e.message));
@@ -233,7 +235,6 @@ export default function App() {
     dashboard: (
       <DashboardPage
         data={room.data}
-        logs={room.orbitLogs}
         locale={locale}
         onOpenRun={() => setPage("runs")}
         onOpenBuild={() => setPage("builds")}
@@ -250,6 +251,7 @@ export default function App() {
         executionEnvironments={room.executionEnvironments}
         targetEnvironments={room.targetEnvironments}
         profiles={room.profiles}
+        loading={room.loading}
         settings={room.settings}
         setSettings={room.setSettings}
         test={test}
@@ -290,6 +292,7 @@ export default function App() {
         locale={locale}
         runs={room.runs}
         onStop={stopRun}
+        onRetry={retryRun}
         onApprove={approveRun}
         onReject={rejectRun}
         onEmergencyStop={() => setConfirmingEmergencyStop(true)}
@@ -309,6 +312,7 @@ export default function App() {
         test={test}
         save={save}
         tested={room.settingsTested}
+        logs={room.orbitLogs}
         onDeleteProfile={(id) => deleteAsset("profile", id)}
       />
     ),

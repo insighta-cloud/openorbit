@@ -4,14 +4,17 @@ import json
 from pathlib import Path
 from typing import Literal
 
-from fastapi import FastAPI, HTTPException, Query, Response
+from fastapi import FastAPI, HTTPException, Query, Response, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
+from . import store as store_module
+from .assistant_tools import AssistantToolExecutor
 from .docker import preflight_docker
 from .providers import AzureOpenAIProvider, BedrockProvider, ModelSettings
 from .store import ConsoleStore
+from .terminal import serve_terminal
 
 app = FastAPI(
     title="OpenOrbit API",
@@ -59,6 +62,7 @@ app.add_middleware(
 )
 store = ConsoleStore()
 WEB_DIST = Path(__file__).resolve().parents[2] / "frontend" / "dist"
+SDK_DOCS_DIST = Path(__file__).resolve().parents[2] / "site"
 
 
 def safely(action):
@@ -167,6 +171,21 @@ def delete_run(run_id: str):
 @app.get("/api/runs/{run_id}/telemetry")
 def run_telemetry(run_id: str):
     return safely(lambda: store.run_telemetry(run_id))
+
+
+@app.get("/api/runs/{run_id}/prompt-revisions")
+def prompt_revisions(run_id: str):
+    return safely(lambda: store.prompt_revisions(run_id))
+
+
+@app.get("/api/runs/{run_id}/commit-changes")
+def commit_changes(run_id: str):
+    return safely(lambda: store.commit_changes(run_id))
+
+
+@app.get("/api/runs/{run_id}/artifacts/{loop_index}/{artifact_path:path}")
+def run_artifact(run_id: str, loop_index: int, artifact_path: str):
+    return safely(lambda: FileResponse(store.run_artifact(run_id, loop_index, artifact_path)))
 
 
 @app.get("/api/dashboard")
@@ -360,8 +379,17 @@ class EvaluationBuildCreate(BaseModel):
     browser_library_path: str = Field(default="", max_length=4_000)
     timezone: str = Field(min_length=1, max_length=64)
     repeat_interval_minutes: int = Field(ge=1, le=10080)
+    cadence_mode: Literal["after_completion", "fixed"] = "after_completion"
+    overrun_policy: Literal["wait", "interrupt_eval"] = "wait"
     run_limit: int = Field(ge=1, le=10000)
+    schedule_enabled: bool = False
+    schedule_weekdays: list[int] = Field(default_factory=list)
+    schedule_start_time: str = Field(default="09:00", pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
+    schedule_end_time: str = Field(default="18:00", pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
+    iteration_strategy: Literal["linear", "score_select"] = "linear"
+    candidates_per_iteration: int = Field(default=2, ge=2, le=8)
     approval_score: int = Field(ge=0, le=10)
+    require_human_approval_before_apply: bool = False
     executor_type: str = Field(
         default="local", pattern=r"^(local|remote-http)$"
     )  # Legacy fallback; selected execution environment is authoritative.
@@ -831,12 +859,52 @@ def application_settings():
 
 class ApplicationSettingsUpdate(BaseModel):
     manager_prompt_template: str = Field(default="", max_length=100_000)
+    manager_output_locale: str = Field(default="", max_length=100)
     chat_model_profile_name: str = Field(default="", max_length=200)
+    assistant_tools: dict | None = None
+
+
+class ApplicationDataLocationUpdate(BaseModel):
+    path: str = Field(min_length=1, max_length=4_096)
+
+
+class RetryRunRequest(BaseModel):
+    restart_from_first: bool = False
+
+
+def application_data_summary() -> dict[str, object]:
+    root = store_module.APP_DATA
+    total = 0
+    try:
+        for path in root.rglob("*"):
+            if path.is_file():
+                try:
+                    total += path.stat().st_size
+                except OSError:
+                    continue
+    except OSError:
+        pass
+    return {"path": str(root), "size_bytes": total}
+
+
+@app.get("/api/application-data")
+def application_data():
+    return application_data_summary()
+
+
+@app.put("/api/application-data")
+def update_application_data(values: ApplicationDataLocationUpdate):
+    global store
+    if any(run.status in {"queued", "running", "awaiting_approval"} for run in store.runs()):
+        raise ValueError("Stop active evaluation runs before changing the app data location")
+    store_module.configure_application_data(values.path)
+    store = ConsoleStore()
+    return application_data_summary()
 
 
 @app.put("/api/application-settings")
 def update_application_settings(values: ApplicationSettingsUpdate):
-    return store.save_application_settings(values.model_dump())
+    return store.save_application_settings(values.model_dump(exclude_unset=True))
 
 
 class ChatTurn(BaseModel):
@@ -970,9 +1038,21 @@ def chat(values: ChatMessage):
         if history:
             prompt += f"Conversation so far:\n{history}\n\n"
         prompt += f"User: {values.content}\nAssistant:"
-        return {"response": provider.complete(settings, prompt), "profile_name": profile_name}
+        tool_executor = AssistantToolExecutor(store.application_settings()["assistant_tools"])
+        definitions = tool_executor.definitions()
+        response = (
+            provider.complete_with_tools(settings, prompt, definitions, tool_executor.execute)
+            if definitions
+            else provider.complete(settings, prompt)
+        )
+        return {"response": response, "profile_name": profile_name}
     except RuntimeError as error:
         raise HTTPException(409, str(error))
+
+
+@app.websocket("/api/terminal")
+async def terminal(websocket: WebSocket):
+    await serve_terminal(websocket, store.application_settings()["assistant_tools"])
 
 
 class SettingsUpdate(BaseModel):
@@ -1116,6 +1196,16 @@ def list_proposal_lifecycles_v1(
     return store.proposal_lifecycles(evaluation_build_id, status)
 
 
+@app.get(
+    "/api/v1/improvements/iterations",
+    tags=["Improvements"],
+    operation_id="listImprovementIterationData",
+    summary="List SDK-saved data files by evaluation iteration",
+)
+def list_improvement_iteration_data_v1(evaluation_build_id: str | None = None):
+    return store.improvement_iteration_data(evaluation_build_id)
+
+
 @app.get("/api/v1/improvements/analytics", tags=["Improvements"], operation_id="getImprovementAnalytics")
 def improvement_analytics_v1(hours: int = Query(default=24, ge=1, le=720)):
     return store.improvement_analytics(hours)
@@ -1171,9 +1261,34 @@ def cancel(run_id: str):
     return safely(lambda: store.cancel(run_id))
 
 
+@app.post("/api/runs/{run_id}/retry")
+def retry(run_id: str, values: RetryRunRequest):
+    return safely(lambda: store.retry(run_id, values.restart_from_first))
+
+
 @app.post("/api/runs/emergency-stop")
 def emergency_stop():
     return store.emergency_stop()
+
+
+@app.get("/sdk-docs/{path:path}", include_in_schema=False)
+def sdk_docs(path: str):
+    """Serve the generated MkDocs runner-SDK reference site."""
+    if not SDK_DOCS_DIST.exists():
+        raise HTTPException(404, "SDK documentation is not built. Run `pnpm run docs:build`.")
+    candidate = (SDK_DOCS_DIST / path).resolve()
+    if path and SDK_DOCS_DIST not in candidate.parents:
+        raise HTTPException(404, "Not found.")
+    if candidate.is_file():
+        return FileResponse(candidate)
+    if path and not path.endswith("/"):
+        directory_index = candidate / "index.html"
+        if directory_index.is_file():
+            return FileResponse(directory_index)
+    index = candidate / "index.html" if path else SDK_DOCS_DIST / "sdk" / "index.html"
+    if index.is_file():
+        return FileResponse(index)
+    raise HTTPException(404, "SDK documentation page was not found.")
 
 
 @app.get("/{path:path}", include_in_schema=False)
