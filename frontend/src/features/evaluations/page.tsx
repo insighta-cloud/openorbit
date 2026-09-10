@@ -35,12 +35,12 @@ import { SupervisorPanel } from "./run-detail-supervisor-panel";
 import { EvaluationResultPanel } from "./run-detail-result-panel";
 
 const phases = [
-  "init",
-  "setup",
-  "run",
-  "eval",
-  "teardown",
-  "finalize",
+  "before_all",
+  "before_each",
+  "execute",
+  "verify",
+  "after_each",
+  "after_all",
 ] as const;
 const time = (locale: Locale, value?: string) =>
   value
@@ -121,7 +121,7 @@ export function EvaluationsPage({
     ui = locales[locale].runUi;
   const [selectedInternal, setSelected] = useState<Run | null>(null),
     [tab, setTab] = useState<RunDetailTab>("result"),
-    [phaseTab, setPhaseTab] = useState<(typeof phases)[number]>("init"),
+    [phaseTab, setPhaseTab] = useState<(typeof phases)[number]>("before_all"),
     [iterationTab, setIterationTab] = useState(1),
     [candidateTab, setCandidateTab] = useState<string | null>(null),
     [telemetry, setTelemetry] = useState<RunTelemetry>(),
@@ -174,7 +174,7 @@ export function EvaluationsPage({
     [pageSize, setPageSize] = useState(15),
     [deleteSelectionOpen, setDeleteSelectionOpen] = useState(false),
     [retryingRun, setRetryingRun] = useState<Run | null>(null);
-  const retryCopy = locale === "ko" ? { title: "평가 실행 재시도", warning: "재시도는 작업 디렉터리 또는 외부 대상의 중간 결과를 변경할 수 있습니다.", restart: "1부터 다시 시작", resume: "마지막 이터레이션부터 재시도", cancel: "취소" } : locale === "ja" ? { title: "評価実行を再試行", warning: "再試行により作業ディレクトリまたは外部ターゲットの中間結果が変わる可能性があります。", restart: "反復 1 から再開", resume: "最後の反復から再試行", cancel: "キャンセル" } : { title: "Retry evaluation run", warning: "Retrying can change intermediate results in the working directory or external target.", restart: "Restart from iteration 1", resume: "Retry from the last iteration", cancel: "Cancel" };
+  const retryCopy = locale === "ko" ? { title: "실행 재시도", warning: "재시도는 작업 디렉터리 또는 외부 대상의 중간 결과를 변경할 수 있습니다.", restart: "1부터 다시 시작", resume: "마지막 이터레이션부터 재시도", cancel: "취소" } : locale === "ja" ? { title: "実行を再試行", warning: "再試行により作業ディレクトリまたは外部ターゲットの中間結果が変わる可能性があります。", restart: "反復 1 から再開", resume: "最後の反復から再試行", cancel: "キャンセル" } : { title: "Retry run", warning: "Retrying can change intermediate results in the working directory or external target.", restart: "Restart from iteration 1", resume: "Retry from the last iteration", cancel: "Cancel" };
   const selected = initialSelectedRun ?? selectedInternal;
   const supervisorTranslationIds = useMemo(
     () =>
@@ -281,12 +281,12 @@ export function EvaluationsPage({
     () => [
       ...new Map(
         runs.map((run) => [
-          run.evaluation_build_id ?? run.workflow_id,
+          run.build_id ?? run.workflow_id,
           {
-            id: run.evaluation_build_id ?? run.workflow_id,
+            id: run.build_id ?? run.workflow_id,
             name:
-              run.evaluation_build_name ??
-              run.evaluation_build_id ??
+              run.build_name ??
+              run.build_id ??
               run.workflow_name,
           },
         ]),
@@ -298,10 +298,10 @@ export function EvaluationsPage({
     (run) =>
       statuses.has(run.status) &&
       (!buildFilter ||
-        (run.evaluation_build_id ?? run.workflow_id) === buildFilter) &&
+        (run.build_id ?? run.workflow_id) === buildFilter) &&
       (modeFilter === "all" || run.execution_mode === modeFilter) &&
       (!phaseFilter || run.current_phase === phaseFilter) &&
-      (!keywordFilter || [run.id, run.evaluation_build_name, run.evaluation_build_id, run.workflow_name, run.status, run.current_phase].some((value) => value?.includes(keywordFilter))) &&
+      (!keywordFilter || [run.id, run.build_name, run.build_id, run.workflow_name, run.status, run.current_phase].some((value) => value?.includes(keywordFilter))) &&
       (!activeOnly || activeStatuses.has(run.status)),
   );
   const toggleStatus = (status: string) =>
@@ -437,18 +437,20 @@ export function EvaluationsPage({
     {id:"select",header:<input aria-label="Select all runs on this page" type="checkbox" checked={allPageSelected} disabled={!selectableRuns.length} onChange={togglePage}/>,render:r=><input aria-label={`Select run ${r.id}`} type="checkbox" checked={selectedRunIds.has(r.id)} disabled={!terminal(r.status)} onChange={()=>toggleRun(r.id)}/>},
     {
       id: "build",
-      header: t.evaluationBuild,
+      header: t.build,
       render: (r) => (
         <span className="run-build">
-          <strong>{r.evaluation_build_name ?? r.evaluation_build_id}</strong>
+          <strong>{r.build_name ?? r.build_id}</strong>
           <code>{r.id}</code>
         </span>
       ),
+      sortValue: (r) => r.build_name ?? r.build_id ?? r.workflow_name,
     },
     {
       id: "started",
       header: t.started,
       render: (r) => time(locale, r.created_at),
+      sortValue: (r) => r.created_at ?? "",
     },
     {
       id: "elapsed",
@@ -458,6 +460,9 @@ export function EvaluationsPage({
           r.created_at,
           terminal(r.status) ? (r.finished_at ?? r.updated_at) : undefined,
         ),
+      sortValue: (r) => terminal(r.status) && r.finished_at
+        ? new Date(r.finished_at).getTime() - new Date(r.created_at ?? 0).getTime()
+        : 0,
     },
     {
       id: "phase",
@@ -467,23 +472,27 @@ export function EvaluationsPage({
           {finalPhase(r)}
         </span>
       ),
+      sortValue: (r) => finalPhase(r),
     },
-    { id: "pid", header: t.pid, render: (r) => r.pid ?? r.last_pid ?? "—" },
+    { id: "pid", header: t.pid, render: (r) => r.pid ?? r.last_pid ?? "—", sortValue: (r) => r.pid ?? r.last_pid ?? -1 },
     {
       id: "proposed",
       header: t.proposed,
       render: (r) => r.proposed_improvements ?? 0,
+      sortValue: (r) => r.proposed_improvements ?? 0,
     },
     {
       id: "approved",
       header: t.approved,
       render: (r) => r.approved_improvements ?? 0,
+      sortValue: (r) => r.approved_improvements ?? 0,
     },
-    { id: "issues", header: t.issues, render: (r) => r.reported_issues ?? 0 },
+    { id: "issues", header: t.issues, render: (r) => r.reported_issues ?? 0, sortValue: (r) => r.reported_issues ?? 0 },
     {
       id: "status",
       header: t.status,
       render: (r) => <StatusBadge value={r.status} label={label(r.status)} />,
+      sortValue: (r) => label(r.status),
     },
     {
       id: "actions",
@@ -530,7 +539,7 @@ export function EvaluationsPage({
       ),
     },
   ];
-  columns[1].header = l.evaluation;
+  columns[1].header = l.task;
   columns.splice(4, 0, {
     id: "iteration",
     header: l.iteration,
@@ -541,29 +550,29 @@ export function EvaluationsPage({
       );
       return current ? `${current}/${r.loop_limit ?? current}` : "—";
     },
+    sortValue: (r) => Math.max(0, ...(r.step_results ?? []).map((step) => step.loop_index ?? 0)),
   });
   const steps = selected?.step_results ?? [],
-    // `finalize` is bookkeeping after the last evaluation loop.  It must not
-    // become the default detail iteration because supervisor results belong to
-    // the actual run/eval loop.
+    // `after_all` is bookkeeping after the last loop. It must not become the
+    // default detail iteration because supervisor results belong to execute/verify.
     iterations = [
       ...new Set([
         ...steps
-          .filter((step) => ["run", "eval"].includes(step.phase ?? step.step_id ?? ""))
+          .filter((step) => ["execute", "verify"].includes(step.phase ?? step.step_id ?? ""))
           .map((step) => step.loop_index ?? 0)
           .filter((index) => index > 0),
         ...(selected?.supervisor_results ?? []).map((item) => item.iteration ?? 0).filter((index) => index > 0),
       ]),
     ].sort((a, b) => a - b),
-    // `init` and `finalize` are process-level steps, not evaluation iterations.
+    // `before_all` and `after_all` are process-level steps, not iterations.
     // Include them beside the relevant iteration so their evidence remains
     // visible without inventing a separate, misleading iteration.
     selectedSteps = steps.filter(
       (step) =>
         (!candidateTab || step.candidate_id === candidateTab) &&
         (step.loop_index === iterationTab ||
-          ((step.phase ?? step.step_id) === "init" && iterationTab === iterations[0]) ||
-          ((step.phase ?? step.step_id) === "finalize" && iterationTab === iterations.at(-1))),
+          ((step.phase ?? step.step_id) === "before_all" && iterationTab === iterations[0]) ||
+          ((step.phase ?? step.step_id) === "after_all" && iterationTab === iterations.at(-1))),
     ),
     availablePhases = phases.filter((phase) =>
       selectedSteps.some((step) => (step.phase ?? step.step_id) === phase),
@@ -788,7 +797,7 @@ export function EvaluationsPage({
               <input value={draftKeywordFilter} onChange={(event) => setDraftKeywordFilter(event.target.value)} placeholder={ui.keywordHint} />
             </label>
             <label>
-              {ui.evaluationBuild}
+              {ui.build}
               <select
                 value={draftBuildFilter}
                 onChange={(event) => setDraftBuildFilter(event.target.value)}
@@ -866,13 +875,13 @@ export function EvaluationsPage({
           const latest = Math.max(
             1,
             ...(r.step_results ?? [])
-              .filter((step) => ["run", "eval"].includes(step.phase ?? step.step_id ?? ""))
+              .filter((step) => ["execute", "verify"].includes(step.phase ?? step.step_id ?? ""))
               .map((step) => step.loop_index ?? 0),
             ...(r.supervisor_results ?? []).map((item) => item.iteration ?? 0),
           );
           setSelected(r);
           setTab("result");
-          setPhaseTab("init");
+          setPhaseTab("before_all");
           setIterationTab(latest);
           setCandidateTab(r.iteration_candidates?.find((candidate) => candidate.iteration === latest && candidate.selected)?.id ?? null);
         }}
@@ -894,8 +903,8 @@ export function EvaluationsPage({
         >
           <div className="run-detail-evaluation">
             <strong>
-              {selected.evaluation_build_name ??
-                selected.evaluation_build_id ??
+              {selected.build_name ??
+                selected.build_id ??
                 selected.workflow_name}
             </strong>
             <code>{selected.id}</code>

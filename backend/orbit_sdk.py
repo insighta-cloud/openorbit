@@ -17,10 +17,142 @@ import threading
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Callable, Literal
+from typing import Any, Callable, Literal
 
 PROJECT_ROOT = Path(os.environ.get("ORBIT_TARGET_REPOSITORY", Path.cwd())).resolve()
 ORBIT_APP_DATA = Path(os.environ.get("ORBIT_APP_DATA", Path.home() / ".local" / "share" / "orbit")).resolve()
+
+# Accept pre-1.0 lifecycle names in existing runner files while emitting the
+# canonical names everywhere else.
+PHASE_ALIASES = {
+    "init": "before_all",
+    "setup": "before_each",
+    "run": "execute",
+    "eval": "verify",
+    "teardown": "after_each",
+    "finalize": "after_all",
+}
+
+
+def canonical_phase(name: str) -> str:
+    """Return the canonical lifecycle key for a current or legacy phase."""
+    return PHASE_ALIASES.get(name, name)
+
+
+@dataclass(frozen=True)
+class GraphNode:
+    """A declarative visual-workflow node attached to a runner function."""
+
+    id: str
+    title: str
+    phase: str | None
+    inputs: tuple[str, ...] = ()
+    outputs: tuple[str, ...] = ()
+    description: str | None = None
+
+
+@dataclass(frozen=True)
+class GraphEdge:
+    """A directed relationship between visual-workflow nodes."""
+
+    source: str
+    target: str
+    kind: Literal["execution", "data", "condition", "loop", "error"] = "execution"
+    label: str | None = None
+    source_port: str | None = None
+    target_port: str | None = None
+
+
+class Graph:
+    """Declare a runner's visual workflow without changing its execution.
+
+    ``graph`` is intentionally declarative: decorators only retain metadata.
+    Orbit may inspect :meth:`definition` before a run, then overlay runtime
+    status onto the same node IDs after a run.
+    """
+
+    def __init__(self) -> None:
+        self._nodes: dict[str, GraphNode] = {}
+        self._edges: list[GraphEdge] = []
+
+    def step(
+        self,
+        id: str | None = None,
+        *,
+        title: str | None = None,
+        phase: str | None = None,
+        inputs: tuple[str, ...] | list[str] = (),
+        outputs: tuple[str, ...] | list[str] = (),
+        description: str | None = None,
+    ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        """Annotate one function as a visual workflow node.
+
+        ``phase`` is an optional display group, not a hard-coded lifecycle
+        enum, so a runner can evolve its lifecycle without changing this API.
+        """
+
+        def register(handler: Callable[..., Any]) -> Callable[..., Any]:
+            node_id = id or handler.__name__
+            if not node_id or node_id in self._nodes:
+                raise ValueError(f"graph node ID must be unique: {node_id!r}")
+            node = GraphNode(
+                id=node_id,
+                title=title or handler.__name__.replace("_", " ").title(),
+                phase=phase,
+                inputs=tuple(inputs),
+                outputs=tuple(outputs),
+                description=description,
+            )
+            self._nodes[node_id] = node
+            setattr(handler, "__orbit_graph_node__", node)
+            return handler
+
+        return register
+
+    def connect(
+        self,
+        source: str,
+        target: str,
+        *,
+        kind: Literal["execution", "data", "condition", "loop", "error"] = "execution",
+        label: str | None = None,
+        source_port: str | None = None,
+        target_port: str | None = None,
+    ) -> GraphEdge:
+        """Declare a typed arrow; ``loop`` and ``condition`` model control flow."""
+        edge = GraphEdge(source, target, kind, label, source_port, target_port)
+        self._edges.append(edge)
+        return edge
+
+    def definition(self) -> dict[str, object]:
+        """Return JSON-safe graph data for a visual client or source inspector."""
+        return {
+            "nodes": [
+                {
+                    "id": node.id,
+                    "title": node.title,
+                    "phase": node.phase,
+                    "inputs": list(node.inputs),
+                    "outputs": list(node.outputs),
+                    "description": node.description,
+                }
+                for node in self._nodes.values()
+            ],
+            "edges": [
+                {
+                    "source": edge.source,
+                    "target": edge.target,
+                    "kind": edge.kind,
+                    "label": edge.label,
+                    "source_port": edge.source_port,
+                    "target_port": edge.target_port,
+                }
+                for edge in self._edges
+            ],
+        }
+
+
+graph = Graph()
 
 
 def ORBIT_PROJECT_PATH(*parts: str) -> Path:
@@ -98,11 +230,14 @@ class RunnerContext:
     loop_index: int
     environment: dict[str, str] = field(default_factory=lambda: dict(os.environ))
 
+    def __post_init__(self) -> None:
+        self.phase = canonical_phase(self.phase)
+
     @property
     def resources(self) -> dict[str, object]:
         """Return the immutable resource snapshot provided for this invocation.
 
-        The snapshot can contain the workflow, evaluation build, fixed test
+        The snapshot can contain the workflow, build, fixed test
         cases, model profile, and execution-environment settings. Prefer the
         typed convenience properties when one is available.
         """
@@ -566,24 +701,24 @@ class RunnerContext:
         self.emit_result({"repository_restore": result})
         return result
 
-    def save_setup_snapshot(self) -> dict[str, object]:
-        """Save this run's baseline once from a ``setup`` lifecycle handler."""
-        if self.phase != "setup":
-            raise ValueError("setup snapshots may only be saved during the setup phase")
+    def save_before_each_snapshot(self) -> dict[str, object]:
+        """Save this run's baseline once from a ``before_each`` handler."""
+        if self.phase != "before_each":
+            raise ValueError("baseline snapshots may only be saved during before_each")
         return self.snapshot_repository("baseline", once=True)
 
-    def save_first_teardown_snapshot(self) -> dict[str, object] | None:
-        """Save the first completed iteration from a ``teardown`` handler."""
-        if self.phase != "teardown":
-            raise ValueError("iteration snapshots may only be saved during the teardown phase")
+    def save_first_after_each_snapshot(self) -> dict[str, object] | None:
+        """Save the first completed iteration from an ``after_each`` handler."""
+        if self.phase != "after_each":
+            raise ValueError("iteration snapshots may only be saved during after_each")
         if self.loop_index != 1:
             return None
         return self.snapshot_repository("iteration-1", once=True)
 
-    def restore_setup_snapshot(self) -> dict[str, object]:
-        """Restore the baseline saved by :meth:`save_setup_snapshot` in ``finalize``."""
-        if self.phase != "finalize":
-            raise ValueError("baseline restoration may only be performed during the finalize phase")
+    def restore_before_each_snapshot(self) -> dict[str, object]:
+        """Restore the baseline saved by :meth:`save_before_each_snapshot` in ``after_all``."""
+        if self.phase != "after_all":
+            raise ValueError("baseline restoration may only be performed during after_all")
         baseline = next(
             (
                 item
@@ -596,6 +731,12 @@ class RunnerContext:
         if baseline is None:
             raise KeyError("this run has no baseline repository snapshot")
         return self.restore_repository_snapshot(str(baseline["id"]))
+
+    # Compatibility aliases for runner assets created before the generic
+    # lifecycle vocabulary. New assets should use the methods above.
+    save_setup_snapshot = save_before_each_snapshot
+    save_first_teardown_snapshot = save_first_after_each_snapshot
+    restore_setup_snapshot = restore_before_each_snapshot
 
     def record_commit_change(self, before: str | None) -> dict[str, object] | None:
         """Retain commit-range evidence when a runner phase advances the target HEAD."""
@@ -752,7 +893,7 @@ class RunnerContext:
         :meth:`rollback_file` to restore a selected one.
         """
         target, relative, directory, manifest_path, manifest = self._load_file_history(relative_path)
-        build = self.evaluation_build
+        build = self.build
         managed_prompt_path = str(build.get("managed_prompt_path") or build.get("prompt_bundle") or "")
         requires_human_approval = bool(build.get("require_human_approval_before_apply", False))
         if requires_human_approval and relative == managed_prompt_path:
@@ -905,7 +1046,7 @@ class RunnerContext:
         )
         if existing is not None:
             return {"recorded": False, "decision": existing}
-        build = self.evaluation_build
+        build = self.build
         record = {
             "id": f"pd-{len(decisions) + 1:06d}-{fingerprint[:12]}",
             "event_type": "decision",
@@ -918,8 +1059,8 @@ class RunnerContext:
             "iteration": self.loop_index,
             "phase": self.phase,
             "run_id": self.environment.get("ORBIT_RUN_ID") or None,
-            "evaluation_build_id": build.get("id") or None,
-            "evaluation_build_name": build.get("name") or None,
+            "build_id": build.get("id") or None,
+            "build_name": build.get("name") or None,
         }
         decisions.append(record)
         _atomic_write(
@@ -951,7 +1092,7 @@ class RunnerContext:
         decisions = document.get("decisions") if isinstance(document, dict) else None
         if not isinstance(decisions, list):
             raise RuntimeError("Orbit proposal decision history is invalid")
-        build = self.evaluation_build
+        build = self.build
         recorded: list[dict[str, object]] = []
         for proposal_id in dict.fromkeys(proposal_ids):
             already_linked = any(
@@ -972,8 +1113,8 @@ class RunnerContext:
                 "iteration": self.loop_index,
                 "phase": self.phase,
                 "run_id": self.environment.get("ORBIT_RUN_ID") or None,
-                "evaluation_build_id": build.get("id") or None,
-                "evaluation_build_name": build.get("name") or None,
+                "build_id": build.get("id") or None,
+                "build_name": build.get("name") or None,
                 "prompt_version": {
                     "id": prompt_version_id,
                     "path": file_update.get("path"),
@@ -1013,13 +1154,13 @@ class RunnerContext:
         return dict(self.resources.get("workflow", {}))
 
     @property
-    def evaluation_build(self) -> dict[str, object]:
-        """Return the evaluation-build snapshot supplied by Orbit."""
-        return dict(self.resources.get("evaluation_build", {}))
+    def build(self) -> dict[str, object]:
+        """Return the build snapshot supplied by Orbit."""
+        return dict(self.resources.get("build", {}))
 
     @property
     def test_cases(self) -> list[dict[str, object]]:
-        """Return the fixed target test cases selected for this evaluation build."""
+        """Return the fixed target test cases selected for this build."""
         return list(self.resources.get("test_cases", []))
 
     def resource(self, name: str, default: object = None) -> object:
@@ -1179,7 +1320,7 @@ class RunnerContext:
         The browser process is short lived.  Scheduling, locking, and any
         application-server lifecycle remain Orbit's responsibility.
         """
-        build = self.evaluation_build
+        build = self.build
         base_url = str(
             build.get("browser_base_url") or self.environment.get("ORBIT_BROWSER_BASE_URL") or ""
         ).strip()
@@ -1305,15 +1446,16 @@ class Runner:
         """Register a function as a handler for one runner lifecycle phase.
 
         Args:
-            name: Lifecycle phase name, normally one of ``init``, ``setup``,
-                ``run``, ``eval``, ``teardown``, or ``finalize``.
+            name: Lifecycle phase name, normally one of ``before_all``,
+                ``before_each``, ``execute``, ``verify``, ``after_each``, or
+                ``after_all``. Legacy names are accepted for compatibility.
 
         Returns:
             A decorator that leaves the registered handler unchanged.
         """
 
         def register(handler: Callable[[RunnerContext], None]) -> Callable[[RunnerContext], None]:
-            self._handlers[name] = handler
+            self._handlers[canonical_phase(name)] = handler
             return handler
 
         return register
@@ -1328,11 +1470,12 @@ class Runner:
         parser = argparse.ArgumentParser(description="Orbit runner phase")
         parser.add_argument("--phase", required=True)
         args = parser.parse_args()
-        handler = self._handlers.get(args.phase)
+        phase = canonical_phase(args.phase)
+        handler = self._handlers.get(phase)
         if handler is None:
             raise SystemExit(f"runner does not define phase: {args.phase}")
         context = RunnerContext(
-            args.phase,
+            phase,
             Path(os.environ["ORBIT_TARGET_REPOSITORY"]),
             os.environ.get("ORBIT_EXECUTION_MODE", "run"),
             int(os.environ.get("ORBIT_LOOP_INDEX", "1")),
