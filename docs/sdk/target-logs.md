@@ -3,11 +3,11 @@
 `ctx.log()` records Orbit runner progress. Use `ctx.target_log()` only for
 meaningful events produced by the AI system or service being evaluated. Orbit
 stores target logs separately from workflow logs and displays them in the
-evaluation run's **Logs** tab.
+run's **Logs** tab.
 
 ```python
-@runner.phase("run")
-def run(ctx):
+@runner.phase("execute")
+def execute(ctx):
     response = call_target_service()
     ctx.target_log(
         "Response accepted",

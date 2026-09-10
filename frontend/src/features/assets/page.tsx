@@ -2,12 +2,15 @@
 import {
   ChevronLeft,
   ChevronRight,
+  ChevronDown,
+  ChevronUp,
+  ChevronsUpDown,
   FileUp,
   Languages,
   Plus,
   Trash2,
 } from "lucide-react";
-import { Children, useEffect, useRef, useState } from "react";
+import { Children, isValidElement, useEffect, useRef, useState } from "react";
 import type {
   ExecutionEnvironment,
   PromptTemplate,
@@ -35,8 +38,8 @@ import { YamlEditor } from "../../components/ui/yaml-editor";
 import { api } from "../../services/api";
 import { useTemplateTranslations } from "../../services/use-template-translation";
 import { useToast } from "../../components/ui/toast-context";
-import { ProfileForm, type ProfileFormCopy } from "../evaluation-builds/page";
-import { Skeleton } from "../../components/ui/skeleton";
+import { ProfileForm, type ProfileFormCopy } from "../builds/page";
+import { SectionSkeleton } from "../../components/ui/section-skeleton";
 
 const text = localeMessageMap<Record<string, string>>("assetsText");
 const testBlank: TargetTestCaseSet = {
@@ -47,17 +50,18 @@ const testBlank: TargetTestCaseSet = {
 };
 
 function CatalogSkeleton() {
-  return <div className="catalog-skeleton" role="status" aria-label="Loading assets"><Skeleton className="catalog-skeleton__title"/><Skeleton className="catalog-skeleton__detail"/><Skeleton className="catalog-skeleton__title"/><Skeleton className="catalog-skeleton__detail"/></div>;
+  return <SectionSkeleton rows={3} />;
 }
+
 const fieldHelp = localeMessageMap<Record<string, string>>("assetsHelp");
 const runnerLabels = localeMessageMap<Record<string, string>>("runnerLabels");
 const phases: WorkflowStep["phase"][] = [
-  "init",
-  "setup",
-  "run",
-  "eval",
-  "teardown",
-  "finalize",
+  "before_all",
+  "before_each",
+  "execute",
+  "verify",
+  "after_each",
+  "after_all",
 ];
 const pipelineYaml = (workflow: Workflow | null | undefined) =>
   phases
@@ -99,7 +103,16 @@ function Catalog({
   loading?: boolean;
   locale: Locale;
 }) {
-  const isLegacyWorkflowSection = title === text[locale].flows;
+  const isLegacyWorkflowSection = title === text[locale].flows,
+    [sort, setSort] = useState<{ key: "name" | "detail" | "createdAt"; direction: "asc" | "desc" }>({ key: "name", direction: "asc" }),
+    rows = Children.toArray(children).filter(isValidElement).sort((left, right) => {
+      const a = String((left.props as { name?: string; detail?: string; createdAt?: string })[sort.key] ?? "");
+      const b = String((right.props as { name?: string; detail?: string; createdAt?: string })[sort.key] ?? "");
+      const value = a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" });
+      return sort.direction === "asc" ? value : -value;
+    }),
+    changeSort = (key: typeof sort.key) => setSort(current => ({ key, direction: current.key === key && current.direction === "asc" ? "desc" : "asc" })),
+    icon = (key: typeof sort.key) => sort.key !== key ? ChevronsUpDown : sort.direction === "asc" ? ChevronUp : ChevronDown;
   return (
     <>
       {showRunners && runners && onRefresh && (
@@ -118,7 +131,12 @@ function Catalog({
           </div>
           <div className="catalog-list">
             {loading ? <CatalogSkeleton /> : Children.count(children) ? (
-              children
+              <>
+                <div className="catalog-list__header">
+                  {(["name", "detail", "createdAt"] as const).map((key) => { const Icon = icon(key); return <button key={key} type="button" onClick={() => changeSort(key)}>{key === "createdAt" ? "Created" : key === "detail" ? "Details" : "Name"}<Icon size={13}/></button>; })}
+                </div>
+                {rows}
+              </>
             ) : (
               <p className="catalog-empty">{emptyHint}</p>
             )}
@@ -1769,6 +1787,14 @@ export function AssetsPage({
     id: string,
   ) => void;
 }) {
+  if (loading) return <>
+    <SectionSkeleton rows={3} />
+    <SectionSkeleton rows={3} />
+    <SectionSkeleton rows={3} />
+    <SectionSkeleton rows={3} />
+    <SectionSkeleton rows={3} />
+    <SectionSkeleton rows={4} />
+  </>;
   return (
     <>
       <ProfileCatalog

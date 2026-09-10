@@ -8,9 +8,42 @@ from base64 import b64encode
 import orbit_sdk as sdk
 
 
+def test_graph_declarations_export_nodes_and_typed_edges():
+    graph = sdk.Graph()
+
+    @graph.step("collect", phase="before_each", outputs=["evidence"])
+    def collect() -> None:
+        pass
+
+    graph.connect("collect", "collect", kind="loop", label="next iteration")
+
+    assert graph.definition() == {
+        "nodes": [
+            {
+                "id": "collect",
+                "title": "Collect",
+                "phase": "before_each",
+                "inputs": [],
+                "outputs": ["evidence"],
+                "description": None,
+            }
+        ],
+        "edges": [
+            {
+                "source": "collect",
+                "target": "collect",
+                "kind": "loop",
+                "label": "next iteration",
+                "source_port": None,
+                "target_port": None,
+            }
+        ],
+    }
+
+
 def context(project, *, iteration: int, run_id: str = "run-123"):
     return sdk.RunnerContext(
-        phase="run",
+        phase="execute",
         target_repository=project,
         mode="run",
         loop_index=iteration,
@@ -31,7 +64,7 @@ def test_update_file_retains_previous_contents_and_metadata(tmp_path, monkeypatc
     version = result["version"]
     assert result["changed"] is True
     assert version["iteration"] == 7
-    assert version["phase"] == "run"
+    assert version["phase"] == "execute"
     assert version["run_id"] == "run-123"
     assert version["previous"]["sha256"] == sdk._sha256(b"before")
     assert version["written"]["sha256"] == sdk._sha256(b"after")
@@ -79,13 +112,13 @@ def test_update_file_blocks_a_managed_prompt_when_human_approval_is_required(tmp
     prompt.write_text("before", encoding="utf-8")
     monkeypatch.setattr(sdk, "ORBIT_APP_DATA", tmp_path / "orbit-data")
     resources = {
-        "evaluation_build": {
+        "build": {
             "managed_prompt_path": "prompt.md",
             "require_human_approval_before_apply": True,
         }
     }
     ctx = sdk.RunnerContext(
-        phase="setup",
+        phase="before_each",
         target_repository=project,
         mode="run",
         loop_index=2,
@@ -203,7 +236,7 @@ def test_repository_snapshot_restores_worktree_index_and_head_without_a_commit(t
     ).stdout
     monkeypatch.setattr(sdk, "ORBIT_APP_DATA", tmp_path / "orbit-data")
     setup = sdk.RunnerContext(
-        phase="setup",
+        phase="before_each",
         target_repository=project,
         mode="run",
         loop_index=1,
@@ -250,7 +283,7 @@ def test_repository_snapshot_restores_worktree_index_and_head_without_a_commit(t
     )
 
     finalized = sdk.RunnerContext(
-        phase="finalize",
+        phase="after_all",
         target_repository=project,
         mode="run",
         loop_index=2,
@@ -293,14 +326,14 @@ def test_first_teardown_snapshot_is_linked_to_its_iteration(tmp_path, monkeypatc
     monkeypatch.setattr(sdk, "ORBIT_APP_DATA", tmp_path / "orbit-data")
 
     first = sdk.RunnerContext(
-        phase="teardown",
+        phase="after_each",
         target_repository=project,
         mode="run",
         loop_index=1,
         environment={"ORBIT_RUN_ID": "checkpoint-run"},
     ).save_first_teardown_snapshot()
     later = sdk.RunnerContext(
-        phase="teardown",
+        phase="after_each",
         target_repository=project,
         mode="run",
         loop_index=2,
@@ -310,7 +343,7 @@ def test_first_teardown_snapshot_is_linked_to_its_iteration(tmp_path, monkeypatc
     assert first is not None
     assert first["label"] == "iteration-1"
     assert first["iteration"] == 1
-    assert first["phase"] == "teardown"
+    assert first["phase"] == "after_each"
     assert later is None
 
 
@@ -327,7 +360,7 @@ def test_runner_records_a_commit_range_after_a_phase(tmp_path, monkeypatch, caps
     monkeypatch.setattr(sdk, "ORBIT_APP_DATA", tmp_path / "orbit-data")
     monkeypatch.setenv("ORBIT_TARGET_REPOSITORY", str(project))
     monkeypatch.setenv("ORBIT_RUN_ID", "commit-run")
-    monkeypatch.setattr(sys, "argv", ["runner", "--phase", "run"])
+    monkeypatch.setattr(sys, "argv", ["runner", "--phase", "execute"])
     phase_runner = sdk.Runner()
 
     @phase_runner.phase("run")
