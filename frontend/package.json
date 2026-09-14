@@ -1,11 +1,12 @@
 {
   "name": "agent-improvement-console-ui",
   "private": true,
-  "version": "0.8.0",
+  "version": "0.9.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
+    "analyze": "tsc -b && vite build --mode analyze",
     "lint": "eslint ."
   },
   "dependencies": {

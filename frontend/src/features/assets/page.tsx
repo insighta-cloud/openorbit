@@ -31,6 +31,7 @@ import {
   type Locale,
 } from "../../locales";
 import { Modal } from "../../components/ui/modal";
+import { ConfirmDialog } from "../../components/ui/confirm-dialog";
 import { PanelHeader } from "../../components/ui/page-header";
 import { SectionInfo } from "../../components/ui/section-info";
 import { PythonEditor } from "../../components/ui/python-editor";
@@ -80,6 +81,77 @@ const pipelineYaml = (workflow: Workflow | null | undefined) =>
     })
     .join("\n\n");
 
+function AssetCatalog({
+  children,
+  loading = false,
+  emptyHint,
+  locale = "en",
+}: {
+  children: React.ReactNode;
+  loading?: boolean;
+  emptyHint: string;
+  locale?: Locale;
+}) {
+  const [sort, setSort] = useState<{
+    key: "name" | "createdAt";
+    direction: "asc" | "desc";
+    }>({ key: "createdAt", direction: "desc" }),
+    rows = Children.toArray(children).filter(isValidElement).sort((left, right) => {
+      const a = String(
+        (left.props as { name?: string; detail?: string; createdAt?: string })[
+          sort.key
+        ] ?? "",
+      );
+      const b = String(
+        (right.props as { name?: string; detail?: string; createdAt?: string })[
+          sort.key
+        ] ?? "",
+      );
+      const value = a.localeCompare(b, undefined, {
+        numeric: true,
+        sensitivity: "base",
+      });
+      return sort.direction === "asc" ? value : -value;
+    }),
+    changeSort = (key: typeof sort.key) =>
+      setSort((current) => ({
+        key,
+        direction:
+          current.key === key && current.direction === "asc" ? "desc" : "asc",
+      })),
+    icon = (key: typeof sort.key) =>
+      sort.key !== key
+        ? ChevronsUpDown
+        : sort.direction === "asc"
+          ? ChevronUp
+          : ChevronDown;
+  return (
+    <div className="catalog-list">
+      {loading ? <CatalogSkeleton /> : rows.length ? (
+        <>
+          <div className="catalog-list__header">
+            {(["name", "createdAt"] as const).map((key) => {
+              const Icon = icon(key);
+              return (
+                <button key={key} type="button" onClick={() => changeSort(key)}>
+                  {key === "createdAt"
+                    ? text[locale].columnCreated
+                    : text[locale].columnName}
+                  <Icon size={13} />
+                </button>
+              );
+            })}
+            <span>{text[locale].columnActions}</span>
+          </div>
+          {rows}
+        </>
+      ) : (
+        <p className="catalog-empty">{emptyHint}</p>
+      )}
+    </div>
+  );
+}
+
 function Catalog({
   title,
   tooltip,
@@ -103,16 +175,7 @@ function Catalog({
   loading?: boolean;
   locale: Locale;
 }) {
-  const isLegacyWorkflowSection = title === text[locale].flows,
-    [sort, setSort] = useState<{ key: "name" | "detail" | "createdAt"; direction: "asc" | "desc" }>({ key: "name", direction: "asc" }),
-    rows = Children.toArray(children).filter(isValidElement).sort((left, right) => {
-      const a = String((left.props as { name?: string; detail?: string; createdAt?: string })[sort.key] ?? "");
-      const b = String((right.props as { name?: string; detail?: string; createdAt?: string })[sort.key] ?? "");
-      const value = a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" });
-      return sort.direction === "asc" ? value : -value;
-    }),
-    changeSort = (key: typeof sort.key) => setSort(current => ({ key, direction: current.key === key && current.direction === "asc" ? "desc" : "asc" })),
-    icon = (key: typeof sort.key) => sort.key !== key ? ChevronsUpDown : sort.direction === "asc" ? ChevronUp : ChevronDown;
+  const isLegacyWorkflowSection = title === text[locale].flows;
   return (
     <>
       {showRunners && runners && onRefresh && (
@@ -129,18 +192,7 @@ function Catalog({
             </div>
             {button}
           </div>
-          <div className="catalog-list">
-            {loading ? <CatalogSkeleton /> : Children.count(children) ? (
-              <>
-                <div className="catalog-list__header">
-                  {(["name", "detail", "createdAt"] as const).map((key) => { const Icon = icon(key); return <button key={key} type="button" onClick={() => changeSort(key)}>{key === "createdAt" ? "Created" : key === "detail" ? "Details" : "Name"}<Icon size={13}/></button>; })}
-                </div>
-                {rows}
-              </>
-            ) : (
-              <p className="catalog-empty">{emptyHint}</p>
-            )}
-          </div>
+          <AssetCatalog locale={locale} loading={loading} emptyHint={emptyHint}>{children}</AssetCatalog>
         </section>
       )}
     </>
@@ -324,6 +376,7 @@ function RunnerModal({
   const copy = runnerLabels[locale];
   const [templates, setTemplates] = useState<RunnerTemplate[]>([]),
     [draft, setDraft] = useState<RunnerAsset | undefined>(editing ?? undefined),
+    [selectedVersion, setSelectedVersion] = useState<number | null>(editing?.version ?? null),
     [notice, setNotice] = useState("");
   const importInput = useRef<HTMLInputElement>(null);
   useEffect(() => {
@@ -339,6 +392,7 @@ function RunnerModal({
       description: template.description,
       template_id: template.id,
       source: template.source,
+      version: 1,
     });
   const changeTemplate = () => {
     setDraft(undefined);
@@ -367,16 +421,23 @@ function RunnerModal({
   const save = (openInVsCode = false) => {
     if (!draft) return;
     const runnerId = editing?.id ?? draft.id;
+    const values = editing
+      ? {
+          name: draft.name,
+          description: draft.description,
+          source: draft.source,
+        }
+      : {
+          id: draft.id,
+          name: draft.name,
+          description: draft.description,
+          template_id: draft.template_id,
+          source: draft.source,
+        };
     api(
       editing ? `/api/runners/${editing.id}` : "/api/runners",
       editing ? "PUT" : "POST",
-      editing
-        ? {
-            name: draft.name,
-            description: draft.description,
-            source: draft.source,
-          }
-        : draft,
+      values,
     )
       .then(async () => {
         onSaved();
@@ -456,6 +517,13 @@ function RunnerModal({
   const selectedTemplate = templates.find(
     (template) => template.id === draft.template_id,
   );
+  const versions = editing?.versions ?? [];
+  const selectVersion = (version: number) => {
+    const selected = versions.find((item) => item.version === version);
+    if (!selected) return;
+    setSelectedVersion(version);
+    setDraft({ ...draft, source: selected.source });
+  };
   return (
     <Modal
       open
@@ -504,6 +572,21 @@ function RunnerModal({
             }
           />
         </label>
+        {editing && (
+          <label className="modal-setting-row">
+            <FieldLabel label={copy.version} description={copy.versionHint} />
+            <div>
+              <select value={selectedVersion ?? editing.version} onChange={(event) => selectVersion(Number(event.target.value))}>
+                {[...versions].sort((a, b) => b.version - a.version).map((version) => (
+                  <option key={version.version} value={version.version}>
+                    v{version.version}{version.version === editing.version ? ` (${copy.current})` : ""}
+                  </option>
+                ))}
+              </select>
+            </div>
+          </label>
+        )}
+        {!editing && <p className="hint">{copy.initialVersion}</p>}
         <label className="runner-source">
           <FieldLabel
             label={copy.source}
@@ -576,7 +659,14 @@ function AssetRow({
         <strong>{name}</strong>
         <span>{detail}</span>
       </button>
-      {createdAt && <time className="catalog-row__created" dateTime={createdAt}>{new Intl.DateTimeFormat(intlLocales[locale ?? "en"], { dateStyle: "medium", timeStyle: "short" }).format(new Date(createdAt))}</time>}
+      <time className="catalog-row__created" dateTime={createdAt}>
+        {createdAt
+          ? new Intl.DateTimeFormat(intlLocales[locale ?? "en"], {
+              dateStyle: "medium",
+              timeStyle: "short",
+            }).format(new Date(createdAt))
+          : "-"}
+      </time>
       <button
         className="icon-button danger"
         aria-label={deleteLabel}
@@ -604,7 +694,7 @@ type ProfileCatalogCopy = {
   empty: string;
   delete: string;
 };
-function ProfileCatalog({
+export function ProfileCatalog({
   locale,
   profiles,
   settings,
@@ -652,9 +742,8 @@ function ProfileCatalog({
           {copy.profiles.create}
         </button>
       </div>
-      <div className="catalog-list">
-        {loading ? <CatalogSkeleton /> : profiles.length ? (
-          profiles.map((profile) => (
+      <AssetCatalog locale={locale} loading={loading} emptyHint={copy.profiles.empty}>
+        {profiles.map((profile) => (
             <AssetRow
               key={profile.profile_name}
               name={profile.profile_name}
@@ -668,11 +757,8 @@ function ProfileCatalog({
               onDelete={() => onDelete(profile.profile_name)}
               deleteLabel={`${copy.profiles.delete} ${profile.profile_name}`}
             />
-          ))
-        ) : (
-          <p className="catalog-empty">{copy.profiles.empty}</p>
-        )}
-      </div>
+          ))}
+      </AssetCatalog>
       <Modal
         open={open}
         title={
@@ -730,13 +816,12 @@ function RunnerCatalog({
           {copy.create}
         </button>
       </div>
-      <div className="catalog-list">
-        {loading ? <CatalogSkeleton /> : items.length ? (
-          items.map((item) => (
+      <AssetCatalog locale={locale} loading={loading} emptyHint={text[locale].emptyRunners}>
+        {items.map((item) => (
             <AssetRow
               key={item.id}
               name={item.name}
-              detail={`${item.id} · ${item.description}`}
+              detail={`${item.id} · v${item.version} · ${item.description}`}
               createdAt={item.created_at}
               locale={locale}
               onClick={() => {
@@ -746,11 +831,8 @@ function RunnerCatalog({
               onDelete={() => remove(item.id)}
               deleteLabel={copy.delete}
             />
-          ))
-        ) : (
-          <p className="catalog-empty">{text[locale].emptyRunners}</p>
-        )}
-      </div>
+          ))}
+      </AssetCatalog>
       {open && (
         <RunnerModal
           locale={locale}
@@ -764,18 +846,24 @@ function RunnerCatalog({
 }
 
 function PromptTemplateEditor({
+  locale,
   template,
   onClose,
   onSaved,
   l,
   help,
 }: {
+  locale: Locale;
   template: PromptTemplate;
   onClose: () => void;
   onSaved: () => Promise<unknown>;
   l: Record<string, string>;
   help: Record<string, string>;
 }) {
+  const copy = localeMessages<Record<string, string>>(locale, "promptDraft");
+  const [pendingAction, setPendingAction] = useState<
+    { type: "close" } | { type: "version"; version: number } | null
+  >(null);
   const draftKey = `orbit.prompt-template-draft.${template.id}`,
     versions = template.versions?.length
       ? template.versions
@@ -784,37 +872,41 @@ function PromptTemplateEditor({
       const saved = localStorage.getItem(draftKey);
       return saved ? (JSON.parse(saved) as PromptTemplate) : { ...template };
     }),
-    [selectedVersion, setSelectedVersion] = useState(template.version),
+    [selectedVersion, setSelectedVersion] = useState(draft.version),
     [notice, setNotice] = useState("");
+  const selectedContent =
+    versions.find((item) => item.version === selectedVersion)?.content ??
+    template.content;
   const dirty =
     draft.name !== template.name ||
-    draft.content !== template.content ||
+    draft.content !== selectedContent ||
     draft.id !== template.id;
   useEffect(() => {
     if (dirty) localStorage.setItem(draftKey, JSON.stringify(draft));
     else localStorage.removeItem(draftKey);
   }, [draft, dirty, draftKey]);
   const close = () => {
-    if (
-      !dirty ||
-      window.confirm("저장하지 않은 수정 내용이 있습니다. 닫을까요?")
-    )
-      onClose();
+    if (dirty) setPendingAction({ type: "close" });
+    else onClose();
   };
-  const selectVersion = (version: number) => {
-    if (
-      dirty &&
-      !window.confirm(
-        "저장하지 않은 수정 내용이 있습니다. 선택한 버전으로 전환할까요?",
-      )
-    )
-      return;
+  const applyVersion = (version: number) => {
     const selected = versions.find((item) => item.version === version);
     if (selected) {
       setSelectedVersion(version);
       setDraft({ ...template, content: selected.content, version });
       localStorage.removeItem(draftKey);
     }
+  };
+  const selectVersion = (version: number) => {
+    if (dirty) setPendingAction({ type: "version", version });
+    else applyVersion(version);
+  };
+  const discard = () => {
+    if (!pendingAction) return;
+    localStorage.removeItem(draftKey);
+    if (pendingAction.type === "close") onClose();
+    else applyVersion(pendingAction.version);
+    setPendingAction(null);
   };
   const save = () =>
     api<PromptTemplate>(
@@ -831,63 +923,74 @@ function PromptTemplateEditor({
       })
       .catch((error) => setNotice(error.message));
   return (
-    <Modal open title={l.addTemplate} onClose={close}>
-      <div className="modal-form">
-        <label className="modal-setting-row">
-          <FieldLabel label={l.id} description={help.id} />
-          <input
-            disabled={template.version > 0}
-            value={draft.id}
-            onChange={(event) => setDraft({ ...draft, id: event.target.value })}
-          />
-        </label>
-        <label className="modal-setting-row">
-          <FieldLabel label={l.name} description={help.name} />
-          <input
-            value={draft.name}
-            onChange={(event) =>
-              setDraft({ ...draft, name: event.target.value })
-            }
-          />
-        </label>
-        <label className="modal-setting-row">
-          <FieldLabel label={l.version} description={help.version} />
-          <select
-            value={selectedVersion}
-            onChange={(event) => selectVersion(Number(event.target.value))}
-          >
-            {[...versions]
-              .sort((a, b) => b.version - a.version)
-              .map((item) => (
-                <option key={item.version} value={item.version}>
-                  v{item.version}
-                </option>
-              ))}
-          </select>
-        </label>
-        <label className="modal-setting-row">
-          <FieldLabel label={l.body} description={help.content} />
-          <textarea
-            rows={14}
-            value={draft.content}
-            onChange={(event) =>
-              setDraft({ ...draft, content: event.target.value })
-            }
-          />
-        </label>
-        {dirty && (
-          <small className="hint">
-            수정 중인 내용이 저장되어 있습니다. 저장하면 새 버전이 생성됩니다.
-          </small>
-        )}
-        <div className="modal-actions">
-          {notice && <small className="hint">{notice}</small>}
-          <button className="approve" onClick={save}>
-            {l.save}
-          </button>
+    <>
+      <Modal open={!pendingAction} title={l.addTemplate} onClose={close}>
+        <div className="modal-form">
+          <label className="modal-setting-row">
+            <FieldLabel label={l.id} description={help.id} />
+            <input
+              disabled={template.version > 0}
+              value={draft.id}
+              onChange={(event) => setDraft({ ...draft, id: event.target.value })}
+            />
+          </label>
+          <label className="modal-setting-row">
+            <FieldLabel label={l.name} description={help.name} />
+            <input
+              value={draft.name}
+              onChange={(event) =>
+                setDraft({ ...draft, name: event.target.value })
+              }
+            />
+          </label>
+          <label className="modal-setting-row">
+            <FieldLabel label={l.version} description={help.version} />
+            <select
+              value={selectedVersion}
+              onChange={(event) => selectVersion(Number(event.target.value))}
+            >
+              {[...versions]
+                .sort((a, b) => b.version - a.version)
+                .map((item) => (
+                  <option key={item.version} value={item.version}>
+                    v{item.version}
+                  </option>
+                ))}
+            </select>
+          </label>
+          <label className="modal-setting-row">
+            <FieldLabel label={l.body} description={help.content} />
+            <textarea
+              rows={14}
+              value={draft.content}
+              onChange={(event) =>
+                setDraft({ ...draft, content: event.target.value })
+              }
+            />
+          </label>
+          {dirty && (
+            <small className="hint">
+              {copy.savedHint}
+            </small>
+          )}
+          <div className="modal-actions">
+            {notice && <small className="hint">{notice}</small>}
+            <button className="approve" onClick={save}>
+              {l.save}
+            </button>
+          </div>
         </div>
-      </div>
-    </Modal>
+      </Modal>
+      <ConfirmDialog
+        open={pendingAction !== null}
+        title={copy.title}
+        description={pendingAction?.type === "version" ? copy.switchDescription : copy.closeDescription}
+        cancelLabel={copy.cancel}
+        confirmLabel={copy.discard}
+        onCancel={() => setPendingAction(null)}
+        onConfirm={discard}
+      />
+    </>
   );
 }
 
@@ -1053,6 +1156,7 @@ function LegacyAssetsPage({
       </Catalog>
       {template && (
         <PromptTemplateEditor
+          locale={locale}
           template={template}
           onClose={() => setTemplate(null)}
           onSaved={onRefresh}
@@ -1294,7 +1398,7 @@ function EnvironmentAssets({
         <p className="hint">
           Reusable runner location, invocation method, and browser runtime.
         </p>
-        <div className="catalog-list">
+        <AssetCatalog emptyHint="No execution environments yet.">
           {executionEnvironments.map((item) => (
             <AssetRow
               key={item.id}
@@ -1318,7 +1422,7 @@ function EnvironmentAssets({
               onDelete={() => onDelete("execution-environment", item.id)}
             />
           ))}
-        </div>
+        </AssetCatalog>
       </section>
       <section className="panel app-settings">
         <div className="panel-title-action">
@@ -1344,7 +1448,7 @@ function EnvironmentAssets({
           Reusable repository, browser URL, and native runner prompt-file
           target.
         </p>
-        <div className="catalog-list">
+        <AssetCatalog emptyHint="No target environments yet.">
           {targetEnvironments.map((item) => (
             <AssetRow
               key={item.id}
@@ -1364,7 +1468,7 @@ function EnvironmentAssets({
               onDelete={() => onDelete("target-environment", item.id)}
             />
           ))}
-        </div>
+        </AssetCatalog>
       </section>
       <Modal
         open={kind === "execution"}
@@ -1573,8 +1677,8 @@ function EnvironmentCatalog({
             {t.create}
           </button>
         </div>
-        <div className="catalog-list">
-          {loading ? <CatalogSkeleton /> : executionEnvironments.map((item) => (
+        <AssetCatalog locale={locale} loading={loading} emptyHint={t.executionHint}>
+          {executionEnvironments.map((item) => (
             <AssetRow
               key={item.id}
               name={item.name}
@@ -1599,7 +1703,7 @@ function EnvironmentCatalog({
               onDelete={() => onDelete("execution-environment", item.id)}
             />
           ))}
-        </div>
+        </AssetCatalog>
       </section>
       <section className="panel app-settings">
         <div className="panel-title-action">
@@ -1626,8 +1730,8 @@ function EnvironmentCatalog({
             {t.create}
           </button>
         </div>
-        <div className="catalog-list">
-          {loading ? <CatalogSkeleton /> : targetEnvironments.map((item) => (
+        <AssetCatalog locale={locale} loading={loading} emptyHint={t.targetHint}>
+          {targetEnvironments.map((item) => (
             <AssetRow
               key={item.id}
               name={item.name}
@@ -1647,7 +1751,7 @@ function EnvironmentCatalog({
               onDelete={() => onDelete("target-environment", item.id)}
             />
           ))}
-        </div>
+        </AssetCatalog>
       </section>
       <Modal
         open={kind === "execution"}
