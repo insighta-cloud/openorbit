@@ -6,6 +6,7 @@ import sys
 from base64 import b64encode
 
 import orbit_sdk as sdk
+import pytest
 
 
 def test_graph_declarations_export_nodes_and_typed_edges():
@@ -39,6 +40,70 @@ def test_graph_declarations_export_nodes_and_typed_edges():
             }
         ],
     }
+
+
+def test_graph_step_inherits_its_zone_from_runner_phase():
+    graph = sdk.Graph()
+    runner = sdk.Runner()
+
+    @graph.step("collect")
+    @runner.phase("setup")
+    def collect() -> None:
+        pass
+
+    assert graph.definition()["nodes"][0]["phase"] == "before_each"
+
+
+def test_function_trace_emits_successful_function_evidence(tmp_path, capsys):
+    ctx = context(tmp_path, iteration=1)
+
+    with ctx.function("collect-source-evidence"):
+        pass
+
+    assert "collect-source-evidence" in capsys.readouterr().out
+
+
+def test_graph_step_automatically_traces_its_execution(tmp_path, capsys):
+    graph = sdk.Graph()
+
+    @graph.step("collect-source-evidence")
+    def collect(ctx) -> None:
+        ctx.log("Collected source evidence")
+
+    collect(context(tmp_path, iteration=1))
+
+    output = capsys.readouterr().out
+    assert "workflow function started: collect-source-evidence" in output
+    assert "workflow function succeeded: collect-source-evidence" in output
+    assert '"status": "running"' in output
+    assert '"status": "succeeded"' in output
+
+
+def test_graph_step_automatically_traces_failures(tmp_path, capsys):
+    graph = sdk.Graph()
+
+    @graph.step("collect-source-evidence")
+    def collect(ctx) -> None:
+        raise RuntimeError("evidence unavailable")
+
+    with pytest.raises(RuntimeError, match="evidence unavailable"):
+        collect(context(tmp_path, iteration=1))
+
+    output = capsys.readouterr().out
+    assert "workflow function failed: collect-source-evidence" in output
+    assert '"status": "failed"' in output
+
+
+def test_nested_function_trace_for_the_same_node_is_emitted_once(tmp_path, capsys):
+    ctx = context(tmp_path, iteration=1)
+
+    with ctx.function("collect-source-evidence"):
+        with ctx.function("collect-source-evidence"):
+            pass
+
+    output = capsys.readouterr().out
+    assert output.count('"status": "running"') == 1
+    assert output.count('"status": "succeeded"') == 1
 
 
 def context(project, *, iteration: int, run_id: str = "run-123"):

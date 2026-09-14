@@ -2,6 +2,7 @@ import { Check, ChevronLeft, ChevronRight, CircleStop, Info, Languages, ListFilt
 import { useEffect, useMemo, useRef, useState } from "react";
 import type {
   Run,
+  WorkflowGraphNode,
   CommitChange,
   PromptRevision,
   RunTelemetry,
@@ -15,6 +16,7 @@ import { PageSizeSelect } from "../../components/ui/page-size-select";
 import { Pagination } from "../../components/ui/pagination";
 import { StatusBadge } from "../../components/ui/status-badge";
 import { Tooltip } from "../../components/ui/tooltip";
+import { WorkflowGraph } from "../../components/workflow-graph";
 import { intlLocales, localeMessageMap, locales, type Locale } from "../../locales";
 import { api } from "../../services/api";
 import { useTemplateTranslations } from "../../services/use-template-translation";
@@ -71,6 +73,13 @@ const elapsed = (start?: string, end?: string) => {
     ),
   );
   return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+};
+const displayedIteration = (run: Run) => {
+  const observed = Math.max(
+    0,
+    ...(run.step_results ?? []).map((step) => step.loop_index ?? 0),
+  );
+  return run.loop_limit ? Math.min(observed, run.loop_limit) : observed;
 };
 const copy = localeMessageMap<Record<string,string>>("evaluations");
 type SupervisorResultTranslation = {
@@ -174,8 +183,11 @@ export function EvaluationsPage({
     [pageSize, setPageSize] = useState(15),
     [deleteSelectionOpen, setDeleteSelectionOpen] = useState(false),
     [retryingRun, setRetryingRun] = useState<Run | null>(null);
-  const retryCopy = locale === "ko" ? { title: "실행 재시도", warning: "재시도는 작업 디렉터리 또는 외부 대상의 중간 결과를 변경할 수 있습니다.", restart: "1부터 다시 시작", resume: "마지막 이터레이션부터 재시도", cancel: "취소" } : locale === "ja" ? { title: "実行を再試行", warning: "再試行により作業ディレクトリまたは外部ターゲットの中間結果が変わる可能性があります。", restart: "反復 1 から再開", resume: "最後の反復から再試行", cancel: "キャンセル" } : { title: "Retry run", warning: "Retrying can change intermediate results in the working directory or external target.", restart: "Restart from iteration 1", resume: "Retry from the last iteration", cancel: "Cancel" };
-  const selected = initialSelectedRun ?? selectedInternal;
+  const retryCopy = locale === "ko" ? { title: "실행 재시도", warning: "재시도는 작업 디렉터리 또는 외부 대상의 중간 결과를 변경할 수 있습니다.", restart: "1부터 다시 시작", resume: "마지막 이터레이션부터 재시도" } : locale === "ja" ? { title: "実行を再試行", warning: "再試行により作業ディレクトリまたは外部ターゲットの中間結果が変わる可能性があります。", restart: "反復 1 から再開", resume: "最後の反復から再試行" } : { title: "Retry run", warning: "Retrying can change intermediate results in the working directory or external target.", restart: "Restart from iteration 1", resume: "Retry from the last iteration" };
+  const selectedSource = initialSelectedRun ?? selectedInternal;
+  const selected = selectedSource
+    ? runs.find((run) => run.id === selectedSource.id) ?? selectedSource
+    : null;
   const supervisorTranslationIds = useMemo(
     () =>
       (selected?.supervisor_results ?? [])
@@ -465,6 +477,12 @@ export function EvaluationsPage({
         : 0,
     },
     {
+      id: "status",
+      header: t.status,
+      render: (r) => <StatusBadge value={r.status} label={label(r.status)} />,
+      sortValue: (r) => label(r.status),
+    },
+    {
       id: "phase",
       header: t.phase,
       render: (r) => (
@@ -488,12 +506,6 @@ export function EvaluationsPage({
       sortValue: (r) => r.approved_improvements ?? 0,
     },
     { id: "issues", header: t.issues, render: (r) => r.reported_issues ?? 0, sortValue: (r) => r.reported_issues ?? 0 },
-    {
-      id: "status",
-      header: t.status,
-      render: (r) => <StatusBadge value={r.status} label={label(r.status)} />,
-      sortValue: (r) => label(r.status),
-    },
     {
       id: "actions",
       header: locales[locale].evaluation.action,
@@ -519,7 +531,7 @@ export function EvaluationsPage({
               </button>
             </>
           )}
-          {["failed", "cancelled"].includes(r.status) && r.execution_type === "pipeline" && (
+          {terminal(r.status) && r.execution_type === "pipeline" && (
             <button className="icon-button" title={retryCopy.title} aria-label={retryCopy.title} onClick={(event) => { event.stopPropagation(); setRetryingRun(r); }}>
               <RotateCcw size={16} />
             </button>
@@ -540,22 +552,20 @@ export function EvaluationsPage({
     },
   ];
   columns[1].header = l.task;
-  columns.splice(4, 0, {
+  columns.splice(5, 0, {
     id: "iteration",
     header: l.iteration,
     render: (r) => {
-      const current = Math.max(
-        0,
-        ...(r.step_results ?? []).map((step) => step.loop_index ?? 0),
-      );
+      const current = displayedIteration(r);
       return current ? `${current}/${r.loop_limit ?? current}` : "—";
     },
-    sortValue: (r) => Math.max(0, ...(r.step_results ?? []).map((step) => step.loop_index ?? 0)),
+    sortValue: displayedIteration,
   });
-  const steps = selected?.step_results ?? [],
+  const steps = useMemo(() => selected?.step_results ?? [], [selected?.step_results]);
+  const iterations =
     // `after_all` is bookkeeping after the last loop. It must not become the
     // default detail iteration because supervisor results belong to execute/verify.
-    iterations = [
+    [
       ...new Set([
         ...steps
           .filter((step) => ["execute", "verify"].includes(step.phase ?? step.step_id ?? ""))
@@ -563,25 +573,65 @@ export function EvaluationsPage({
           .filter((index) => index > 0),
         ...(selected?.supervisor_results ?? []).map((item) => item.iteration ?? 0).filter((index) => index > 0),
       ]),
-    ].sort((a, b) => a - b),
+    ].sort((a, b) => a - b);
     // `before_all` and `after_all` are process-level steps, not iterations.
     // Include them beside the relevant iteration so their evidence remains
     // visible without inventing a separate, misleading iteration.
-    selectedSteps = steps.filter(
+  const selectedSteps = steps.filter(
       (step) =>
         (!candidateTab || step.candidate_id === candidateTab) &&
         (step.loop_index === iterationTab ||
           ((step.phase ?? step.step_id) === "before_all" && iterationTab === iterations[0]) ||
           ((step.phase ?? step.step_id) === "after_all" && iterationTab === iterations.at(-1))),
-    ),
-    availablePhases = phases.filter((phase) =>
-      selectedSteps.some((step) => (step.phase ?? step.step_id) === phase),
-    ),
-    supervision = selected?.supervisor_results?.find(
-      (item) => item.iteration === iterationTab && (!candidateTab || item.candidate_id === candidateTab),
-    ),
-    result = supervision?.response,
-    evaluation = result?.evaluation;
+    );
+  const availablePhases = phases.filter((phase) =>
+    selectedSteps.some((step) => (step.phase ?? step.step_id) === phase),
+  );
+  const supervision = selected?.supervisor_results?.find(
+    (item) => item.iteration === iterationTab && (!candidateTab || item.candidate_id === candidateTab),
+  );
+  const result = supervision?.response;
+  const evaluation = result?.evaluation;
+  const workflowGraph = useMemo(() => {
+    const definition = selected?.workflow_graph;
+    if (!definition?.nodes.length) return null;
+    return {
+      ...definition,
+      nodes: definition.nodes.map((node) => {
+        const phaseSteps = steps.filter((step) => (step.phase ?? step.step_id) === node.phase);
+        const latestStep = phaseSteps.at(-1);
+        const phaseHasFunctionTrace = phaseSteps.some((step) => Array.isArray(step.result?.workflow_functions));
+        const firstNodeInPhase = definition.nodes.find((candidate) => candidate.phase === node.phase);
+        const functionTrace = [...steps].reverse().flatMap((step) => {
+          const traces = step.result?.workflow_functions;
+          return Array.isArray(traces) ? [...traces].reverse() : [];
+        }).find((trace) => typeof trace === "object" && trace !== null && trace.id === node.id) as { status?: WorkflowGraphNode["status"] } | undefined;
+        const supervisingEvidence = selected?.status === "running"
+          && selected.current_phase === "verify"
+          && selected.supervisor_status === "pending"
+          && node.phase === "verify"
+          && functionTrace?.status === "succeeded";
+        const interruptedFunction = selected && terminal(selected.status) && functionTrace?.status === "running";
+        const status: WorkflowGraphNode["status"] = interruptedFunction
+            ? "skipped"
+          : functionTrace?.status
+            && !supervisingEvidence
+            ? functionTrace.status
+          : supervisingEvidence
+            ? "running"
+          : selected?.status === "running" && node.phase === selected.current_phase && !phaseHasFunctionTrace && firstNodeInPhase?.id === node.id
+            ? "running"
+          : latestStep?.in_progress
+            ? "idle"
+          : latestStep?.error || (latestStep?.exit_code ?? 0) !== 0
+            ? phaseHasFunctionTrace ? "idle" : "failed"
+          : latestStep
+              ? "succeeded"
+              : "idle";
+        return { ...node, status };
+      }),
+    };
+  }, [selected, steps]);
   const resultFilterOptions = useMemo(() => {
     const improvementStatuses = new Set<string>(),
       issueSeverities = new Set<string>(),
@@ -886,7 +936,7 @@ export function EvaluationsPage({
           setCandidateTab(r.iteration_candidates?.find((candidate) => candidate.iteration === latest && candidate.selected)?.id ?? null);
         }}
         className="active-evaluation-table"
-        gridTemplateColumns="36px minmax(220px,2fr) minmax(145px,1fr) 82px 90px 72px 96px 96px 82px 94px 72px 72px"
+        gridTemplateColumns="36px minmax(220px,2fr) minmax(145px,1fr) 82px 72px 90px 72px 96px 96px 82px 94px 72px"
         empty={t.noRuns}
       />
       <Pagination locale={locale} page={currentPage} totalPages={totalPages} totalItems={filteredRuns.length} pageSize={pageSize} onPageChange={setPage}/>
@@ -900,6 +950,10 @@ export function EvaluationsPage({
             onSelectedRunClose?.();
           }}
           className="modal--run-detail"
+          headerActions={<>
+            <button className="icon-button" title={retryCopy.title} aria-label={retryCopy.title} disabled={!terminal(selected.status) || selected.execution_type !== 'pipeline'} onClick={() => setRetryingRun(selected)}><RotateCcw size={16} /></button>
+            <button className="icon-button danger" title={t.stop} aria-label={t.stop} disabled={!activeStatuses.has(selected.status)} onClick={() => onStop(selected.id)}><CircleStop size={16} /></button>
+          </>}
         >
           <div className="run-detail-evaluation">
             <strong>
@@ -941,6 +995,13 @@ export function EvaluationsPage({
               <strong>{evaluation?.approval ?? "—"}</strong>
             </div>
           </div>
+          <section className="run-detail-workflow-graph" aria-label={l.workflowGraph}>
+            {workflowGraph ? (
+              <WorkflowGraph nodes={workflowGraph.nodes} edges={workflowGraph.edges} />
+            ) : (
+              <p className="hint">{l.noWorkflowGraph}</p>
+            )}
+          </section>
           <RunDetailTabs
             activeTab={tab}
             onSelect={setTab}
@@ -1248,7 +1309,6 @@ export function EvaluationsPage({
         <div className="modal-form retry-confirmation">
           <p className="confirm-description">{retryCopy.warning}</p>
           <div className="modal-actions">
-            <button className="ghost" onClick={() => setRetryingRun(null)}>{retryCopy.cancel}</button>
             <button className="reject" onClick={() => { if (retryingRun) onRetry(retryingRun.id, false); setRetryingRun(null); }}>{retryCopy.resume}</button>
             <button className="approve" onClick={() => { if (retryingRun) onRetry(retryingRun.id, true); setRetryingRun(null); }}>{retryCopy.restart}</button>
           </div>

@@ -14,8 +14,10 @@ import os
 import subprocess
 import tempfile
 import threading
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from functools import wraps
 from pathlib import Path
 from typing import Any, Callable, Literal
 
@@ -95,17 +97,32 @@ class Graph:
             node_id = id or handler.__name__
             if not node_id or node_id in self._nodes:
                 raise ValueError(f"graph node ID must be unique: {node_id!r}")
+            node_phase = canonical_phase(phase or getattr(handler, "__orbit_phase__", "")) or None
             node = GraphNode(
                 id=node_id,
                 title=title or handler.__name__.replace("_", " ").title(),
-                phase=phase,
+                phase=node_phase,
                 inputs=tuple(inputs),
                 outputs=tuple(outputs),
                 description=description,
             )
             self._nodes[node_id] = node
             setattr(handler, "__orbit_graph_node__", node)
-            return handler
+
+            @wraps(handler)
+            def instrumented(*args: Any, **kwargs: Any) -> Any:
+                context = next(
+                    (value for value in (*args, *kwargs.values()) if isinstance(value, RunnerContext)),
+                    None,
+                )
+                if context is None:
+                    return handler(*args, **kwargs)
+                with context.function(node_id):
+                    return handler(*args, **kwargs)
+
+            setattr(instrumented, "__orbit_graph_node__", node)
+            setattr(handler, "__orbit_graph_wrapper__", instrumented)
+            return instrumented
 
         return register
 
@@ -229,9 +246,66 @@ class RunnerContext:
     mode: str
     loop_index: int
     environment: dict[str, str] = field(default_factory=lambda: dict(os.environ))
+    _active_workflow_functions: set[str] = field(default_factory=set, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.phase = canonical_phase(self.phase)
+
+    @contextmanager
+    def function(self, function_id: str):
+        """Record one graph-annotated function's outcome within this lifecycle phase."""
+        if not function_id.strip():
+            raise ValueError("function_id must not be empty")
+        if function_id in self._active_workflow_functions:
+            yield
+            return
+        self._active_workflow_functions.add(function_id)
+        started = datetime.now(UTC)
+        self.log(f"workflow function started: {function_id}")
+        self.emit_result(
+            {
+                "workflow_functions": [
+                    {
+                        "id": function_id,
+                        "status": "running",
+                        "started_at": started.isoformat(),
+                    }
+                ]
+            }
+        )
+        try:
+            yield
+        except BaseException:
+            self.log(f"workflow function failed: {function_id}")
+            self.emit_result(
+                {
+                    "workflow_functions": [
+                        {
+                            "id": function_id,
+                            "status": "failed",
+                            "started_at": started.isoformat(),
+                            "ended_at": datetime.now(UTC).isoformat(),
+                        }
+                    ]
+                }
+            )
+            raise
+        else:
+            self.log(f"workflow function succeeded: {function_id}")
+            self.emit_result(
+                {
+                    "workflow_functions": [
+                        {
+                            "id": function_id,
+                            "status": "succeeded",
+                            "started_at": started.isoformat(),
+                            "ended_at": datetime.now(UTC).isoformat(),
+                        }
+                    ]
+                }
+            )
+        finally:
+            self._active_workflow_functions.discard(function_id)
 
     @property
     def resources(self) -> dict[str, object]:
@@ -1192,10 +1266,13 @@ class RunnerContext:
             aws_profile=str(profile.get("aws_profile", "")),
         )
         provider = AzureOpenAIProvider() if settings.provider == "azure-openai" else BedrockProvider()
+        self.log(f"target model request started: {settings.provider}/{settings.model}")
+        response = provider.complete(settings, prompt)
+        self.log(f"target model request completed: {settings.provider}/{settings.model}")
         return {
             "profile_name": str(profile.get("profile_name", "")),
             "model": settings.model,
-            "response": provider.complete(settings, prompt),
+            "response": response,
         }
 
     @property
@@ -1329,6 +1406,7 @@ class RunnerContext:
         selected_cases = cases if cases is not None else self.test_cases
         if not selected_cases:
             raise ValueError("at least one fixed test case is required for a Playwright journey")
+        self.log(f"browser journey started: {len(selected_cases)} case(s) against {base_url}")
         artifacts = (
             self.app_data
             / "artifacts"
@@ -1371,6 +1449,8 @@ await browser.close(); console.log(JSON.stringify({base_url:input.baseUrl,result
         except (json.JSONDecodeError, IndexError) as error:
             raise RuntimeError("Playwright did not return structured journey evidence") from error
         evidence["artifacts_directory"] = str(artifacts)
+        passed = sum(bool(item.get("passed")) for item in evidence.get("results", []))
+        self.log(f"browser journey completed: {passed}/{len(selected_cases)} case(s) passed")
         self.emit_result({"browser_journey": evidence})
         return evidence
 
@@ -1430,7 +1510,9 @@ await browser.close(); console.log(JSON.stringify({base_url:input.baseUrl,result
             reader.join()
         output = "".join(lines)
         if process.returncode:
+            self.log(f"exec failed with exit code {process.returncode}: {' '.join(command)}")
             raise SystemExit(process.returncode)
+        self.log(f"exec completed: {' '.join(command)}")
         return output
 
 
@@ -1455,7 +1537,9 @@ class Runner:
         """
 
         def register(handler: Callable[[RunnerContext], None]) -> Callable[[RunnerContext], None]:
-            self._handlers[canonical_phase(name)] = handler
+            phase = canonical_phase(name)
+            self._handlers[phase] = handler
+            setattr(handler, "__orbit_phase__", phase)
             return handler
 
         return register
@@ -1468,8 +1552,13 @@ class Runner:
         process environment; callers should not invoke this method directly.
         """
         parser = argparse.ArgumentParser(description="Orbit runner phase")
-        parser.add_argument("--phase", required=True)
+        command = parser.add_mutually_exclusive_group(required=True)
+        command.add_argument("--phase")
+        command.add_argument("--graph", action="store_true")
         args = parser.parse_args()
+        if args.graph:
+            print(json.dumps(graph.definition(), ensure_ascii=False))
+            return
         phase = canonical_phase(args.phase)
         handler = self._handlers.get(phase)
         if handler is None:
@@ -1480,6 +1569,7 @@ class Runner:
             os.environ.get("ORBIT_EXECUTION_MODE", "run"),
             int(os.environ.get("ORBIT_LOOP_INDEX", "1")),
         )
+        handler = getattr(handler, "__orbit_graph_wrapper__", handler)
         before = context.git_head()
         try:
             handler(context)
