@@ -135,6 +135,26 @@
         "modelDeployment": {
           "label": "Model / deployment",
           "hint": "The provider-specific model or deployment name to invoke."
+        },
+        "azureEndpoint": {
+          "label": "Azure endpoint",
+          "hint": "The Azure OpenAI resource endpoint, such as https://your-resource.openai.azure.com."
+        },
+        "region": {
+          "label": "Region",
+          "hint": "The cloud region used for this provider, such as eastus or us-east-1."
+        },
+        "awsProfile": {
+          "label": "AWS CLI profile (optional)",
+          "hint": "Optional local AWS CLI credential profile to use for Bedrock requests."
+        },
+        "secretEnv": {
+          "label": "Secret env variable",
+          "hint": "The environment variable that holds this provider's API key or credentials."
+        },
+        "createNewAiProfile": {
+          "label": "Create new AI model profile…",
+          "hint": "Create and assign a new AI model profile for this build."
         }
       }
     },
@@ -234,6 +254,12 @@
       "deleteBuild": {
         "title": "Delete build?",
         "description": "This permanently removes the build and its configuration.",
+        "cancel": "Cancel",
+        "confirm": "Delete"
+      },
+      "deleteAsset": {
+        "title": "Delete asset?",
+        "description": "This permanently removes the asset and its configuration.",
         "cancel": "Cancel",
         "confirm": "Delete"
       },
@@ -381,6 +407,7 @@
       "buildListDescription": "Create and manage recurring tasks that connect a target, workflow, and reusable assets.",
       "createBuild": "Create build",
       "name": "Name",
+      "tasks": "Tasks",
       "repository": "Repository",
       "prompt": "Prompt",
       "purpose": "Purpose",
@@ -497,6 +524,8 @@
       "createAssetsAndBuild": "Create assets and a build",
       "creating": "Creating…",
       "quickStartReview": "A runner, policy, test set, execution environment, target environment, and build will be created.",
+      "quickStartWorkflowDescription": "Preview how this runner will move through its workflow when it runs.",
+      "runnerWorkflowDescription": "Preview how the selected runner will move through its workflow when it runs.",
       "chatOpen": "Open chat assistant",
       "chatCollapse": "Collapse chat",
       "chatTitle": "Orbit assistant",
@@ -569,6 +598,7 @@
     "templateTranslation": {
       "translate": "Translate",
       "translating": "Translating…",
+      "checkingCache": "Checking saved translations…",
       "showOriginal": "Show original",
       "failed": "Template translation failed. Please try again."
     },
@@ -727,6 +757,7 @@
     "evaluations": {
       "title": "Runs",
       "task": "Task",
+      "orphanedBuild": "The build for this run no longer exists.",
       "evaluation": "Result",
       "iteration": "Iteration",
       "detail": "Run detail",

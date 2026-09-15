@@ -38,7 +38,7 @@ import { SectionInfo } from "../../components/ui/section-info";
 import { PythonEditor } from "../../components/ui/python-editor";
 import { WorkflowGraph } from "../../components/workflow-graph";
 import { YamlEditor } from "../../components/ui/yaml-editor";
-import { api } from "../../services/api";
+import { api, upload } from "../../services/api";
 import { useTemplateTranslations } from "../../services/use-template-translation";
 import { useToast } from "../../components/ui/toast-context";
 import { ProfileForm, type ProfileFormCopy } from "../builds/page";
@@ -163,6 +163,7 @@ function Catalog({
   showRunners = false,
   runners,
   onRefresh,
+  onDelete,
   loading = false,
   locale,
 }: {
@@ -174,14 +175,15 @@ function Catalog({
   showRunners?: boolean;
   runners?: RunnerAsset[];
   onRefresh?: () => Promise<unknown>;
+  onDelete?: (kind: "runner", id: string) => void;
   loading?: boolean;
   locale: Locale;
 }) {
   const isLegacyWorkflowSection = title === text[locale].flows;
   return (
     <>
-      {showRunners && runners && onRefresh && (
-        <RunnerCatalog locale={locale} items={runners} onRefresh={onRefresh} loading={loading} />
+      {showRunners && runners && onRefresh && onDelete && (
+        <RunnerCatalog locale={locale} items={runners} onRefresh={onRefresh} loading={loading} onDelete={onDelete} />
       )}{" "}
       {!isLegacyWorkflowSection && (
         <section className="panel app-settings">
@@ -391,7 +393,7 @@ function RunnerModal({
     id: "empty",
     name: copy.empty,
     description: copy.emptyDescription,
-    source: "from orbit_sdk import runner\n\n\n@runner.phase(\"before_all\")\ndef before_all(ctx):\n    # TODO: Add one-time setup before the run starts.\n    pass\n\n\n@runner.phase(\"before_each\")\ndef before_each(ctx):\n    # TODO: Add setup for each iteration.\n    pass\n\n\n@runner.phase(\"execute\")\ndef execute(ctx):\n    # TODO: Add the main work for this iteration.\n    pass\n\n\n@runner.phase(\"verify\")\ndef verify(ctx):\n    # TODO: Verify the result of this iteration.\n    pass\n\n\n@runner.phase(\"after_each\")\ndef after_each(ctx):\n    # TODO: Add cleanup for each iteration.\n    pass\n\n\n@runner.phase(\"after_all\")\ndef after_all(ctx):\n    # TODO: Add one-time cleanup after the run ends.\n    pass\n\n\nif __name__ == \"__main__\":\n    runner.main()\n",
+    source: "from orbit_sdk import graph, runner\n\ngraph.connect(\"initialize-runner\", \"prepare-iteration\")\ngraph.connect(\"prepare-iteration\", \"run-iteration\")\ngraph.connect(\"run-iteration\", \"verify-iteration\")\ngraph.connect(\"verify-iteration\", \"close-iteration\")\ngraph.connect(\"close-iteration\", \"prepare-iteration\", kind=\"loop\", label=\"next iteration\")\ngraph.connect(\"close-iteration\", \"finalize-runner\", kind=\"condition\", label=\"completed\")\n\n\n@graph.step(\"initialize-runner\", title=\"Initialize runner\", phase=\"before_all\", outputs=[\"runner_ready\"])\n@runner.phase(\"before_all\")\ndef before_all(ctx):\n    # TODO: Add one-time setup before the run starts.\n    pass\n\n\n@graph.step(\"prepare-iteration\", title=\"Prepare iteration\", phase=\"before_each\", inputs=[\"runner_ready\"], outputs=[\"iteration_ready\"])\n@runner.phase(\"before_each\")\ndef before_each(ctx):\n    # TODO: Add setup for each iteration.\n    pass\n\n\n@graph.step(\"run-iteration\", title=\"Run iteration\", phase=\"execute\", inputs=[\"iteration_ready\"], outputs=[\"iteration_result\"])\n@runner.phase(\"execute\")\ndef execute(ctx):\n    # TODO: Add the main work for this iteration.\n    pass\n\n\n@graph.step(\"verify-iteration\", title=\"Verify iteration\", phase=\"verify\", inputs=[\"iteration_result\"], outputs=[\"verification\"])\n@runner.phase(\"verify\")\ndef verify(ctx):\n    # TODO: Verify the result of this iteration.\n    pass\n\n\n@graph.step(\"close-iteration\", title=\"Close iteration\", phase=\"after_each\", inputs=[\"verification\"], outputs=[\"iteration_complete\"])\n@runner.phase(\"after_each\")\ndef after_each(ctx):\n    # TODO: Add cleanup for each iteration.\n    pass\n\n\n@graph.step(\"finalize-runner\", title=\"Finalize runner\", phase=\"after_all\", inputs=[\"iteration_complete\"], outputs=[\"final_status\"])\n@runner.phase(\"after_all\")\ndef after_all(ctx):\n    # TODO: Add one-time cleanup after the run ends.\n    pass\n\n\nif __name__ == \"__main__\":\n    runner.main()\n",
   };
   const templateOptions = [emptyTemplate, ...templates];
   useEffect(() => {
@@ -421,7 +423,8 @@ function RunnerModal({
     graphInFlight.current = source;
     setGraphLoading(true);
     setGraphError("");
-    api<WorkflowGraphDefinition | null>("/api/runners/preview-graph", "POST", { source })
+    api<{ id: string }>("/api/runners/graph-drafts", "POST", { source })
+      .then((draft) => api<WorkflowGraphDefinition | null>(`/api/runners/graph-drafts/${encodeURIComponent(draft.id)}/preview`))
       .then((graph) => {
         if (draftSource.current !== source) return;
         setWorkflowGraph(graph);
@@ -440,12 +443,7 @@ function RunnerModal({
   const importTemplate = async (file: File | undefined) => {
     if (!file) return;
     try {
-      const values = JSON.parse(await file.text()) as RunnerTemplate;
-      const imported = await api<RunnerTemplate>(
-        "/api/runner-templates/import",
-        "POST",
-        values,
-      );
+      const imported = await upload<RunnerTemplate>("/api/runner-templates/import-package", file);
       setTemplates((current) => [
         ...current.filter((template) => template.id !== imported.id),
         imported,
@@ -494,7 +492,9 @@ function RunnerModal({
       templates.map((template) => template.id),
       locale,
     ),
-    translationCopy = locales[locale].templateTranslation;
+    translationCopy = locales[locale].templateTranslation,
+    allRunnerTemplatesTranslated =
+      templates.length > 0 && templates.every((template) => Boolean(translations.content(template.id)));
   if (!draft)
     return (
       <Modal open title={copy.createTitle} onClose={onClose}>
@@ -506,23 +506,25 @@ function RunnerModal({
                 ref={importInput}
                 className="visually-hidden"
                 type="file"
-                accept="application/json,.json"
+                accept="application/zip,.zip"
                 onChange={(event) => importTemplate(event.target.files?.[0])}
               />
-              <button
-                className="ghost"
-                type="button"
-                disabled={translations.loading}
+                <button
+                  className="ghost"
+                  type="button"
+                  disabled={translations.loading || translations.cacheLoading}
                 onClick={
-                  translations.content(templates[0]?.id ?? "")
-                    ? () => translations.showOriginal()
-                    : () => translations.translate()
+                    allRunnerTemplatesTranslated
+                      ? () => translations.showOriginal()
+                      : () => translations.translate()
                 }
               >
                 <Languages size={15} />
-                {translations.loading
-                  ? translationCopy.translating
-                  : translations.content(templates[0]?.id ?? "")
+                  {translations.loading
+                    ? translationCopy.translating
+                    : translations.cacheLoading
+                      ? translationCopy.checkingCache
+                    : allRunnerTemplatesTranslated
                     ? translationCopy.showOriginal
                     : translationCopy.translate}
               </button>
@@ -537,14 +539,18 @@ function RunnerModal({
             </div>
           </div>
           <div className="runner-template-grid">
-            {templateOptions.map((template) => (
-              <RunnerTemplateCard
-                key={template.id}
-                template={template}
-                translation={translations.content(template.id)}
-                choose={choose}
-              />
-            ))}
+            {translations.cacheLoading ? (
+              <p className="hint">{translationCopy.checkingCache}</p>
+            ) : (
+              templateOptions.map((template) => (
+                <RunnerTemplateCard
+                  key={template.id}
+                  template={template}
+                  translation={translations.content(template.id)}
+                  choose={choose}
+                />
+              ))
+            )}
           </div>
           {translations.error && (
             <small className="hint">{translationCopy.failed}</small>
@@ -556,6 +562,9 @@ function RunnerModal({
   const selectedTemplate = templateOptions.find(
     (template) => template.id === draft.template_id,
   );
+  const selectedTemplateDisplay = selectedTemplate
+    ? { ...selectedTemplate, ...(translations.content(selectedTemplate.id) ?? {}) }
+    : null;
   const versions = editing?.versions ?? [];
   const selectVersion = (version: number) => {
     const selected = versions.find((item) => item.version === version);
@@ -574,8 +583,8 @@ function RunnerModal({
           <div className="runner-template-selection">
             <div>
               <small>{copy.basedOn}</small>
-              <strong>{selectedTemplate?.name ?? draft.template_id}</strong>
-              <span>{selectedTemplate?.description}</span>
+              <strong>{selectedTemplateDisplay?.name ?? draft.template_id}</strong>
+              <span>{selectedTemplateDisplay?.description}</span>
             </div>
             <button className="ghost" type="button" onClick={changeTemplate}>
               {copy.changeTemplate}
@@ -821,17 +830,17 @@ function RunnerCatalog({
   items,
   onRefresh,
   loading,
+  onDelete,
 }: {
   locale: Locale;
   items: RunnerAsset[];
   onRefresh: () => Promise<unknown>;
   loading: boolean;
+  onDelete: (kind: "runner", id: string) => void;
 }) {
   const [open, setOpen] = useState(false),
     [editing, setEditing] = useState<RunnerAsset | null>(null);
   const copy = runnerLabels[locale], sectionDetails = localeMessages<Record<string, string>>(locale, "sectionDetails");
-  const remove = (id: string) =>
-    api(`/api/runners/${id}`, "DELETE").then(onRefresh);
   return (
     <section className="panel app-settings">
       <div className="panel-title-action">
@@ -864,7 +873,7 @@ function RunnerCatalog({
                 setEditing(item);
                 setOpen(true);
               }}
-              onDelete={() => remove(item.id)}
+              onDelete={() => onDelete("runner", item.id)}
               deleteLabel={copy.delete}
             />
           ))}
@@ -1051,7 +1060,7 @@ function LegacyAssetsPage({
   onRefresh: () => Promise<unknown>;
   onCreateWorkflow: (values: unknown) => Promise<unknown>;
   onUpdateWorkflow: (id: string, values: unknown) => Promise<unknown>;
-  onDelete: (kind: "template" | "test-set" | "workflow", id: string) => void;
+  onDelete: (kind: "template" | "test-set" | "runner" | "workflow", id: string) => void;
 }) {
   const createLabel = locales[locale].ui.create,
     l: Record<string, string> = {
@@ -1161,6 +1170,7 @@ function LegacyAssetsPage({
         showRunners
         runners={runners}
         onRefresh={onRefresh}
+        onDelete={onDelete}
         emptyHint={l.emptyFlows}
         title={l.flows}
         tooltip={localeMessages<Record<string, string>>(locale, "sectionDetails").assetRunners}
@@ -1921,6 +1931,7 @@ export function AssetsPage({
       | "profile"
       | "template"
       | "test-set"
+      | "runner"
       | "workflow"
       | "execution-environment"
       | "target-environment",

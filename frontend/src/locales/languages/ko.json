@@ -134,6 +134,26 @@
         "modelDeployment": {
           "label": "모델 / 배포 이름",
           "hint": "호출할 프로바이더별 모델 또는 배포 이름입니다."
+        },
+        "azureEndpoint": {
+          "label": "Azure 엔드포인트",
+          "hint": "https://your-resource.openai.azure.com 같은 Azure OpenAI 리소스 엔드포인트입니다."
+        },
+        "region": {
+          "label": "리전",
+          "hint": "eastus 또는 us-east-1처럼 이 프로바이더에 사용하는 클라우드 리전입니다."
+        },
+        "awsProfile": {
+          "label": "AWS CLI 프로필(선택 사항)",
+          "hint": "Bedrock 요청에 사용할 선택적 로컬 AWS CLI 자격 증명 프로필입니다."
+        },
+        "secretEnv": {
+          "label": "시크릿 환경 변수",
+          "hint": "이 프로바이더의 API 키나 자격 증명을 담은 환경 변수 이름입니다."
+        },
+        "createNewAiProfile": {
+          "label": "새 AI 모델 프로필 생성…",
+          "hint": "이 빌드에 새 AI 모델 프로필을 생성하고 할당합니다."
         }
       }
     },
@@ -233,6 +253,12 @@
       "deleteBuild": {
         "title": "빌드를 삭제할까요?",
         "description": "빌드와 해당 설정이 영구적으로 삭제됩니다.",
+        "cancel": "취소",
+        "confirm": "삭제"
+      },
+      "deleteAsset": {
+        "title": "자산을 삭제할까요?",
+        "description": "자산과 해당 설정이 영구적으로 삭제됩니다.",
         "cancel": "취소",
         "confirm": "삭제"
       },
@@ -380,6 +406,7 @@
       "buildListDescription": "대상, 워크플로, 재사용 자산을 연결한 반복 태스크를 관리합니다.",
       "createBuild": "빌드 생성",
       "name": "이름",
+      "tasks": "태스크",
       "repository": "저장소",
       "prompt": "프롬프트",
       "purpose": "목적",
@@ -496,6 +523,8 @@
       "createAssetsAndBuild": "자산 및 빌드 생성",
       "creating": "생성 중…",
       "quickStartReview": "러너, 정책, 테스트 세트, 실행 환경, 대상 환경 및 빌드를 생성합니다.",
+      "quickStartWorkflowDescription": "실행 시 러너가 워크플로우를 따라 어떻게 동작하는지 미리 확인하세요.",
+      "runnerWorkflowDescription": "선택한 러너가 실행 시 워크플로우를 따라 어떻게 동작하는지 미리 확인하세요.",
       "chatOpen": "챗봇 열기",
       "chatCollapse": "챗봇 접기",
       "chatTitle": "Orbit 도우미",
@@ -568,6 +597,7 @@
     "templateTranslation": {
       "translate": "번역",
       "translating": "번역 중…",
+      "checkingCache": "저장된 번역을 확인하는 중…",
       "showOriginal": "원문 보기",
       "failed": "템플릿 번역에 실패했습니다. 다시 시도해 주세요."
     },
@@ -602,7 +632,7 @@
       "importFailed": "템플릿을 가져오지 못했습니다",
       "basedOn": "기반 템플릿",
       "changeTemplate": "템플릿 변경",
-      "empty": "Empty",
+      "empty": "비어 있음",
       "emptyDescription": "비어 있는 6단계 러너로 시작합니다.",
       "id": "ID",
       "name": "이름",
@@ -726,6 +756,7 @@
     "evaluations": {
       "title": "실행 이력",
       "task": "태스크",
+      "orphanedBuild": "이 실행의 빌드가 더 이상 존재하지 않습니다.",
       "evaluation": "결과",
       "iteration": "반복",
       "detail": "실행 상세",

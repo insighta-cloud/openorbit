@@ -6,6 +6,7 @@ import { ToastProvider } from "./components/ui/toast";
 import { SectionSkeleton } from "./components/ui/section-skeleton";
 import type { Page, Run } from "./domain/models";
 import { DashboardPage } from "./features/dashboard/page";
+import { QuickStartModal } from "./components/quick-start-modal";
 
 const AssetsPage = lazy(() =>
   import("./features/assets/page").then((module) => ({
@@ -60,9 +61,14 @@ const pages: Page[] = [
   "issues",
   "settings",
 ];
-const pageFromHash = (): Page => {
-  const page = window.location.hash.slice(1);
-  return pages.includes(page as Page) ? (page as Page) : "dashboard";
+const pageFromLocation = (): Page => {
+  const path = window.location.pathname.replace(/^\/+|\/+$/g, "");
+  if (pages.includes(path as Page)) return path as Page;
+
+  // Preserve links saved before the browser-path migration, then normalize
+  // them on first render below.
+  const legacyHash = window.location.hash.slice(1);
+  return pages.includes(legacyHash as Page) ? (legacyHash as Page) : "dashboard";
 };
 type ConfirmCopy = {
   title: string;
@@ -70,28 +76,42 @@ type ConfirmCopy = {
   cancel: string;
   confirm: string;
 };
+type AssetDeleteKind =
+  | "profile"
+  | "template"
+  | "test-set"
+  | "runner"
+  | "workflow"
+  | "execution-environment"
+  | "target-environment";
 
 export default function App() {
-  const [page, setPageState] = useState<Page>(pageFromHash);
+  const [page, setPageState] = useState<Page>(pageFromLocation);
   const [locale, setLocaleState] = useState<Locale>(savedLocale);
   const [theme, setThemeState] = useState(savedTheme);
   const [deletingBuild, setDeletingBuild] = useState<string | null>(null);
+  const [deletingAsset, setDeletingAsset] = useState<{
+    kind: AssetDeleteKind;
+    id: string;
+  } | null>(null);
   const [confirmingEmergencyStop, setConfirmingEmergencyStop] = useState(false);
-  const [quickStartRequest, setQuickStartRequest] = useState(0);
+  const [quickStartOpen, setQuickStartOpen] = useState(false);
   const [quickStartSelection, setQuickStartSelection] = useState<string>();
   const room = useControlRoom();
   const ui = locales[locale].ui;
   useEffect(() => {
-    const sync = () => setPageState(pageFromHash());
-    if (!window.location.hash)
-      window.history.replaceState(null, "", "#dashboard");
-    window.addEventListener("hashchange", sync);
-    return () => window.removeEventListener("hashchange", sync);
+    const sync = () => setPageState(pageFromLocation());
+    const path = window.location.pathname.replace(/^\/+|\/+$/g, "");
+    if (!pages.includes(path as Page) || window.location.hash)
+      window.history.replaceState(null, "", `/${pageFromLocation()}`);
+    window.addEventListener("popstate", sync);
+    return () => window.removeEventListener("popstate", sync);
   }, []);
   const setPage = (next: Page) => {
     window.scrollTo({ top: 0, left: 0, behavior: "auto" });
-    if (window.location.hash === `#${next}`) setPageState(next);
-    else window.location.hash = next;
+    if (window.location.pathname !== `/${next}` || window.location.hash)
+      window.history.pushState(null, "", `/${next}`);
+    setPageState(next);
   };
   const setLocale = (value: Locale) => {
     localStorage.setItem(localeStorageKey, value);
@@ -103,8 +123,7 @@ export default function App() {
   };
   const openQuickStart = (id?: string) => {
     setQuickStartSelection(id);
-    setQuickStartRequest((value) => value + 1);
-    setPage("builds");
+    setQuickStartOpen(true);
   };
   const test = () =>
     api<{ response: string }>("/api/settings/hello", "POST", room.settings)
@@ -224,17 +243,7 @@ export default function App() {
         room.setNotice(e.message);
         throw e;
       });
-  const deleteAsset = (
-    kind:
-      | "profile"
-      | "template"
-      | "test-set"
-      | "runner"
-      | "workflow"
-      | "execution-environment"
-      | "target-environment",
-    id: string,
-  ) => {
+  const deleteAsset = (kind: AssetDeleteKind, id: string) => {
     const path = {
       profile: `/api/settings/profiles/${encodeURIComponent(id)}`,
       template: `/api/prompt-templates/${id}`,
@@ -250,6 +259,12 @@ export default function App() {
         room.refresh();
       })
       .catch((e) => room.setNotice(e.message));
+  };
+  const confirmDeleteAsset = () => {
+    if (!deletingAsset) return;
+    const { kind, id } = deletingAsset;
+    setDeletingAsset(null);
+    deleteAsset(kind, id);
   };
   const deleteBuild = (id: string) => setDeletingBuild(id);
   const confirmDeleteBuild = () => {
@@ -297,7 +312,7 @@ export default function App() {
         onRefresh={room.refresh}
         onCreateWorkflow={createWorkflow}
         onUpdateWorkflow={updateWorkflow}
-        onDelete={deleteAsset}
+        onDelete={(kind, id) => setDeletingAsset({ kind, id })}
       />
     ),
     builds: (
@@ -316,13 +331,7 @@ export default function App() {
         onUpdate={updateBuild}
         onToggleStar={toggleBuildStar}
         onDelete={deleteBuild}
-        onQuickStartCreate={createQuickStart}
-        quickStartRequest={quickStartRequest}
-        quickStartSelection={quickStartSelection}
-        onQuickStartRequestHandled={() => {
-          setQuickStartRequest(0);
-          setQuickStartSelection(undefined);
-        }}
+        onOpenQuickStart={() => openQuickStart()}
       />
     ),
     runs: (
@@ -335,6 +344,7 @@ export default function App() {
         onReject={rejectRun}
         onEmergencyStop={() => setConfirmingEmergencyStop(true)}
         onDeleteRuns={deleteRuns}
+        knownBuilds={room.builds}
       />
     ),
     improvements: <ImprovementsPage
@@ -365,15 +375,17 @@ export default function App() {
         save={save}
         tested={room.settingsTested}
         logs={room.orbitLogs}
-        onDeleteProfile={(id) => deleteAsset("profile", id)}
+        onDeleteProfile={(id) => setDeletingAsset({ kind: "profile", id })}
       />
     ),
   }[page];
   const confirmations = localeMessages<{
     deleteBuild: ConfirmCopy;
+    deleteAsset: ConfirmCopy;
     emergencyStop: ConfirmCopy;
   }>(locale, "confirmations");
   const confirmation = confirmations.deleteBuild;
+  const assetConfirmation = confirmations.deleteAsset;
   const emergencyConfirmation = confirmations.emergencyStop;
   return (
     <AppShell
@@ -390,6 +402,19 @@ export default function App() {
      <Suspense fallback={<SectionSkeleton rows={6} />}>
   <div className="page-stack">{content}</div>
 </Suspense>
+      <QuickStartModal
+        key={`${quickStartOpen}:${quickStartSelection ?? ""}`}
+        open={quickStartOpen}
+        initialQuickStartId={quickStartSelection}
+        profiles={room.profiles}
+        locale={locale}
+        create={createQuickStart}
+        onClose={() => {
+          setQuickStartOpen(false);
+          setQuickStartSelection(undefined);
+        }}
+        onCreated={() => setPage("builds")}
+      />
       <ConfirmDialog
         open={deletingBuild !== null}
         title={confirmation.title}
@@ -398,6 +423,15 @@ export default function App() {
         confirmLabel={confirmation.confirm}
         onCancel={() => setDeletingBuild(null)}
         onConfirm={confirmDeleteBuild}
+      />
+      <ConfirmDialog
+        open={deletingAsset !== null}
+        title={assetConfirmation.title}
+        description={assetConfirmation.description}
+        cancelLabel={assetConfirmation.cancel}
+        confirmLabel={assetConfirmation.confirm}
+        onCancel={() => setDeletingAsset(null)}
+        onConfirm={confirmDeleteAsset}
       />
       <ConfirmDialog
         open={confirmingEmergencyStop}
