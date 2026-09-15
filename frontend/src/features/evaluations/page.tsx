@@ -44,6 +44,8 @@ const phases = [
   "after_each",
   "after_all",
 ] as const;
+const phaseLabel = (phase: string) =>
+  phase.replaceAll("_", " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
 const time = (locale: Locale, value?: string) =>
   value
     ? new Intl.DateTimeFormat(intlLocales[locale], {
@@ -85,7 +87,7 @@ const copy = localeMessageMap<Record<string,string>>("evaluations");
 type SupervisorResultTranslation = {
   prompt?: string;
   response: {
-    evaluation: { behavior_summary?: string; behavior_trace?: { purpose: string; rationale: string; observation: string; decision: string; next_action: string }; summary?: string };
+    evaluation: { behavior_summary?: string; behavior_trace?: { persona_goal?: string; current_action?: string; next_action?: string; evidence?: string; expectation?: string; interpretation?: string; impact?: string; next_step?: string; purpose?: string; rationale?: string; observation?: string; decision?: string }; summary?: string };
     improvements: Record<string, string>[];
     reported_issues: Record<string, string>[];
   };
@@ -113,6 +115,7 @@ export function EvaluationsPage({
   locale,
   initialSelectedRun,
   onSelectedRunClose,
+  detailOnly = false,
 }: {
   runs: Run[];
   onStop: (id: string) => void;
@@ -124,6 +127,7 @@ export function EvaluationsPage({
   locale: Locale;
   initialSelectedRun?: Run | null;
   onSelectedRunClose?: () => void;
+  detailOnly?: boolean;
 }) {
   const t = locales[locale].common,
     l = copy[locale],
@@ -287,7 +291,9 @@ export function EvaluationsPage({
     if (run.status === "succeeded") return l.complete;
     if (run.status === "cancelled") return l.cancelled;
     if (run.status === "failed") return l.failed;
-    return run.current_phase === "waiting" ? l.waiting : (run.current_phase ?? "—");
+    return run.current_phase === "waiting"
+      ? l.waiting
+      : (run.current_phase ? phaseLabel(run.current_phase) : "—");
   };
   const builds = useMemo(
     () => [
@@ -485,11 +491,7 @@ export function EvaluationsPage({
     {
       id: "phase",
       header: t.phase,
-      render: (r) => (
-        <span className={`run-phase run-phase--${r.status}`}>
-          {finalPhase(r)}
-        </span>
-      ),
+      render: (r) => <StatusBadge value={r.status} label={finalPhase(r)} />,
       sortValue: (r) => finalPhase(r),
     },
     { id: "pid", header: t.pid, render: (r) => r.pid ?? r.last_pid ?? "—", sortValue: (r) => r.pid ?? r.last_pid ?? -1 },
@@ -682,8 +684,8 @@ export function EvaluationsPage({
         resultAttemptFilter === "all" ||
         improvements.some((improvement) =>
           resultAttemptFilter === "attempted"
-            ? improvement.attempted === true || improvement.status === "adopted"
-            : improvement.attempted !== true && improvement.status !== "adopted",
+            ? improvement.attempted === true || ["adopted", "accepted"].includes(String(improvement.status))
+            : improvement.attempted !== true && !["adopted", "accepted"].includes(String(improvement.status)),
         );
       const improvementStatusMatches =
         resultImprovementStatus === "all" ||
@@ -786,7 +788,8 @@ export function EvaluationsPage({
       </div>
     ) : undefined;
   return (
-    <section className="panel active-evaluation-panel">
+    <>
+      {!detailOnly && <section className="panel active-evaluation-panel">
       <div className="panel-title-action">
         <div className="panel-title-action__copy">
           <PanelHeader
@@ -888,7 +891,7 @@ export function EvaluationsPage({
                 </option>
                 {availablePhases.map((phase) => (
                   <option key={phase} value={phase}>
-                    {phase}
+                    {phaseLabel(phase)}
                   </option>
                 ))}
                 <option value="waiting">{l.waiting}</option>
@@ -915,7 +918,6 @@ export function EvaluationsPage({
       </div>
       <div className="run-history-actions">
         <span>{ui.selected(selectedRunIds.size)}</span>
-        <button className="ghost" onClick={() => setSelectedRunIds(new Set())} disabled={!selectedRunIds.size}>{ui.deselect}</button>
         <button className="icon-button danger" aria-label={ui.deleteSelected} title={ui.deleteSelected} onClick={deleteSelected} disabled={!selectedRunIds.size}><Trash2 size={15}/></button>
       </div>
       <DataTable
@@ -941,6 +943,7 @@ export function EvaluationsPage({
       />
       <Pagination locale={locale} page={currentPage} totalPages={totalPages} totalItems={filteredRuns.length} pageSize={pageSize} onPageChange={setPage}/>
       <ConfirmDialog open={deleteSelectionOpen} title={ui.deleteSelectedTitle} description={ui.deleteSelectedDescription(selectedRunIds.size)} cancelLabel={l.cancel} confirmLabel={ui.delete} onCancel={()=>setDeleteSelectionOpen(false)} onConfirm={confirmDeleteSelected}/>
+      </section>}
       {selected && (
         <Modal
           open
@@ -973,7 +976,7 @@ export function EvaluationsPage({
             </div>
             <div>
               <small>{l.phase}</small>
-              <strong>{finalPhase(selected)}</strong>
+              <StatusBadge value={selected.status} label={finalPhase(selected)} />
             </div>
             <div>
               <small>{t.elapsed}</small>
@@ -1036,7 +1039,7 @@ export function EvaluationsPage({
                     className={phaseTab === phase ? "active" : ""}
                     onClick={() => setPhaseTab(phase)}
                   >
-                    {phase}
+                    {phaseLabel(phase)}
                   </button>
                 ))}
               </div>
@@ -1057,6 +1060,10 @@ export function EvaluationsPage({
                 empty={l.noLogs}
                 orbitLogs={l.orbitLogs}
                 targetLogs={l.targetLogs}
+                telemetry={telemetry}
+                openTelemetryTrace={l.openTelemetryTrace}
+                loadingOpenTelemetryTrace={l.loadingOpenTelemetryTrace}
+                noOpenTelemetrySpans={l.noOpenTelemetrySpans}
               />
             </RunDetailTabPanel>
           )}
@@ -1102,8 +1109,6 @@ export function EvaluationsPage({
               <SupervisorPanel
                 record={translateSupervisorRecord(supervision)}
                 l={l}
-                telemetry={telemetry}
-                iteration={iterationTab}
                 renderLineOutput={(value) => <LineNumberedOutput value={value} />}
               />
             </RunDetailTabPanel>
@@ -1295,6 +1300,8 @@ export function EvaluationsPage({
                 error={resultTranslations.error && <small className="hint">{translationCopy.failed}</small>}
                 records={resultRecords}
                 summaries={resultBehaviorTraces}
+                runId={selected.id}
+                steps={steps}
                 improvements={resultImprovements}
                 issues={resultIssues}
                 l={l}
@@ -1314,6 +1321,6 @@ export function EvaluationsPage({
           </div>
         </div>
       </Modal>
-    </section>
+    </>
   );
 }

@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import orbit_sdk as sdk
 import pytest
+import yaml
 from app import main as main_module
 from app import providers
 from app import store as store_module
@@ -14,12 +15,24 @@ from app.main import app
 from app.models import Run, Step, Workflow
 from fastapi.testclient import TestClient
 from orbit_sdk import RunnerContext
+from starlette.requests import Request
 
 
 def test_health_is_available():
     response = TestClient(app).get("/api/health")
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
+
+
+def test_request_locale_prefers_the_browser_accept_language_priority():
+    request = Request(
+        {
+            "type": "http",
+            "headers": [(b"accept-language", b"ja;q=0.6, ko-KR;q=0.9, en;q=0.8")],
+        }
+    )
+
+    assert main_module.request_locale(request) == "ko-KR"
 
 
 def test_generated_sdk_docs_are_served_from_the_local_app(tmp_path, monkeypatch):
@@ -107,6 +120,53 @@ def test_runner_target_logs_are_retained_separately_from_runner_output(tmp_path,
     ]
     assert all(entry["run_id"] == "target-log-run" for entry in step["target_logs"])
     assert all(entry["iteration"] == 3 and entry["phase"] == "execute" for entry in step["target_logs"])
+
+
+def test_runner_exec_can_forward_child_output_to_target_logs(tmp_path, monkeypatch):
+    monkeypatch.setattr(store_module, "RUNS", tmp_path / "runs")
+    project = tmp_path / "target"
+    project.mkdir()
+    runner = project / "runner.py"
+    runner.write_text(
+        "import sys\n"
+        "from orbit_sdk import runner\n"
+        "@runner.phase('execute')\n"
+        "def run(ctx):\n"
+        "    ctx.exec([sys.executable, '-c', \"print('adapter ready')\"], target_log_source='test-adapter')\n"
+        "if __name__ == '__main__': runner.main()\n",
+        encoding="utf-8",
+    )
+    timestamp = store_module.now()
+    store = store_module.ConsoleStore()
+    store._save(
+        Run(
+            id="forwarded-target-log-run",
+            workflow_id="workflow",
+            workflow_name="Workflow",
+            repository=str(project),
+            status="running",
+            created_at=timestamp,
+            updated_at=timestamp,
+        )
+    )
+
+    store._execute_step(
+        "forwarded-target-log-run",
+        Step(
+            id="run",
+            phase="execute",
+            name="Run",
+            command=[sys.executable, str(runner), "--phase", "execute"],
+            working_directory=str(project),
+        ),
+        loop_index=1,
+    )
+
+    step = store._load("forwarded-target-log-run").step_results[-1]
+    assert "adapter ready" in step["output"]
+    assert [(entry["source"], entry["message"]) for entry in step["target_logs"]] == [
+        ("test-adapter", "adapter ready"),
+    ]
 
 
 def test_running_workflow_function_is_retained_before_its_step_finishes(tmp_path, monkeypatch):
@@ -519,6 +579,49 @@ def test_score_select_retains_candidates_and_selects_highest_supervisor_score(tm
     ]
 
 
+def test_linear_runs_complete_supervision_after_each_iteration(tmp_path, monkeypatch):
+    monkeypatch.setattr(store_module, "RUNS", tmp_path / "runs")
+    store = store_module.ConsoleStore()
+    timestamp = store_module.now()
+    run = Run(
+        id="linear-supervision",
+        workflow_id="workflow",
+        workflow_name="Workflow",
+        execution_mode="run",
+        status="queued",
+        created_at=timestamp,
+        updated_at=timestamp,
+        loop_limit=2,
+        iteration_strategy="linear",
+    )
+    store._save(run)
+    workflow = Workflow(
+        id="workflow",
+        name="Workflow",
+        description="",
+        kind="simulation",
+        risk="low",
+        steps=[Step(id="verify", phase="verify", name="Verify", command=[], working_directory=".")],
+    )
+    monkeypatch.setattr(store, "_runner_execution_plan", lambda _: workflow)
+    completed_iterations = []
+
+    def execute_step(run_id, step, loop_index=1, resources=None, **_kwargs):
+        current = store._load(run_id)
+        current.step_results.append({"phase": step.phase, "loop_index": loop_index})
+        store._save(current)
+
+    def supervise(run_id):
+        completed_iterations.append(store._load(run_id).step_results[-1]["loop_index"])
+
+    monkeypatch.setattr(store, "_execute_step", execute_step)
+    monkeypatch.setattr(store, "_complete_supervision", supervise)
+
+    store._execute(run.id)
+
+    assert completed_iterations == [1, 2]
+
+
 def test_deleting_a_completed_run_removes_its_history(tmp_path, monkeypatch):
     monkeypatch.setattr(store_module, "RUNS", tmp_path / "runs")
     store = store_module.ConsoleStore()
@@ -594,7 +697,7 @@ def test_active_evaluations_count_feedback_across_all_iterations(monkeypatch):
             {
                 "iteration": 1,
                 "response": {
-                    "improvements": [{"title": "Add refund intake", "status": "adopted"}],
+                    "improvements": [{"title": "Add refund intake", "status": "accepted"}],
                     "reported_issues": [{"title": "Missing refund details"}],
                 },
             },
@@ -682,6 +785,128 @@ def test_runner_saves_immutable_versions_and_can_resolve_an_older_version(tmp_pa
     assert "v2" in store._runner_entry_path("versioned-runner", 2).read_text(encoding="utf-8")
     assert [step.phase for step in store._runner_execution_plan("versioned-runner", 1).steps] == ["execute"]
     assert [step.phase for step in store._runner_execution_plan("versioned-runner", 2).steps] == ["verify"]
+
+
+def test_bundle_runner_updates_in_place_and_keeps_immutable_versions(tmp_path, monkeypatch):
+    monkeypatch.setattr(store_module, "RUNNERS", tmp_path / "runners")
+    bundle = store_module.RUNNERS / "bundle-runner"
+    bundle.mkdir(parents=True)
+    initial_source = "from orbit_sdk import runner\n@runner.phase('execute')\ndef run(ctx): pass\n"
+    (bundle / "runner.py").write_text(initial_source, encoding="utf-8")
+    (bundle / "runner.json").write_text(
+        json.dumps({"id": "bundle-runner", "name": "Bundle", "description": "Versioned bundle."}),
+        encoding="utf-8",
+    )
+    store = store_module.ConsoleStore()
+
+    updated = store.update_runner(
+        "bundle-runner",
+        {
+            "name": "Bundle",
+            "description": "Versioned bundle.",
+            "source": "from orbit_sdk import runner\n@runner.phase('verify')\ndef run(ctx): pass\n",
+        },
+    )
+
+    assert updated["version"] == 2
+    assert [item["version"] for item in updated["versions"]] == [1, 2]
+    assert (bundle / "runner.py").read_text(encoding="utf-8") == updated["source"]
+    assert not (store_module.RUNNERS / "bundle-runner.py").exists()
+    assert [step.phase for step in store._runner_execution_plan("bundle-runner", 1).steps] == ["execute"]
+    assert [step.phase for step in store._runner_execution_plan("bundle-runner", 2).steps] == ["verify"]
+
+
+def test_legacy_external_runners_and_templates_migrate_target_log_forwarding(tmp_path, monkeypatch):
+    monkeypatch.setattr(store_module, "RUNNERS", tmp_path / "runners")
+    monkeypatch.setattr(store_module, "RUNNER_TEMPLATES", tmp_path / "runner-templates")
+    store_module.RUNNERS.mkdir()
+    store_module.RUNNER_TEMPLATES.mkdir()
+
+    legacy_adapter = (
+        "from orbit_sdk import runner\n"
+        "def invoke(ctx):\n"
+        "    return ctx.exec(['adapter'], timeout=3600)\n"
+        "@runner.phase('execute')\n"
+        "def run(ctx): invoke(ctx)\n"
+        "# ORBIT_ADAPTER_COMMAND\n"
+    )
+    legacy_probe = legacy_adapter.replace(
+        "return ctx.exec(['adapter'], timeout=3600)",
+        "return ctx.exec(\n        ['probe'],\n        timeout=3600,\n        env={},\n    )",
+    ).replace("ORBIT_ADAPTER_COMMAND", "ORBIT_PROBE_COMMAND")
+    internal_runner = (
+        "from orbit_sdk import runner\n"
+        "@runner.phase('execute')\n"
+        "def run(ctx):\n"
+        "    ctx.exec(['git', 'status'], timeout=3600)\n"
+    )
+    for runner_id, template_id, source in (
+        ("legacy-adapter", "external-command-adapter", legacy_adapter),
+        ("quick-start-probe", "evidence-gated-probe-cycle", legacy_probe),
+        ("native-runner", "native-improvement-cycle", internal_runner),
+    ):
+        (store_module.RUNNERS / f"{runner_id}.py").write_text(source, encoding="utf-8")
+        (store_module.RUNNERS / f"{runner_id}.json").write_text(
+            json.dumps(
+                {
+                    "id": runner_id,
+                    "name": runner_id,
+                    "description": "Legacy runner.",
+                    "template_id": template_id,
+                    "version": 1,
+                }
+            ),
+            encoding="utf-8",
+        )
+    template_source = legacy_adapter.replace("ORBIT_ADAPTER_COMMAND", "ORBIT_SELENIUM_COMMAND")
+    (store_module.RUNNER_TEMPLATES / "selenium-external-journey.py").write_text(
+        template_source, encoding="utf-8"
+    )
+    (store_module.RUNNER_TEMPLATES / "selenium-external-journey.json").write_text(
+        json.dumps(
+            {
+                "id": "selenium-external-journey",
+                "name": "Selenium",
+                "description": "Legacy Selenium template.",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    store = store_module.ConsoleStore()
+
+    adapter = store._runner("legacy-adapter")
+    probe = store._runner("quick-start-probe")
+    assert adapter["version"] == 2
+    assert [item["version"] for item in adapter["versions"]] == [1, 2]
+    assert 'target_log_source="external-adapter"' in adapter["source"]
+    assert 'target_log_source="evidence-probe"' in probe["source"]
+    assert store._runner("native-runner")["version"] == 1
+    assert "target_log_source" not in store._runner("native-runner")["source"]
+    assert 'target_log_source="selenium-adapter"' in (
+        store_module.RUNNER_TEMPLATES / "selenium-external-journey.py"
+    ).read_text(encoding="utf-8")
+
+
+def test_deleting_issue_management_items_hides_them_without_deleting_run_evidence(tmp_path, monkeypatch):
+    monkeypatch.setattr(store_module, "ISSUE_MANAGEMENT", tmp_path / "issue-management.yaml")
+    store = store_module.ConsoleStore()
+    proposal = {
+        "proposal_id": "run-1:1:0",
+        "title": "Retain evidence",
+        "target": "prompt",
+        "events": [],
+    }
+    monkeypatch.setattr(store, "proposal_lifecycles", lambda: [proposal])
+
+    assert store.issue_management_items()[0]["proposal_id"] == proposal["proposal_id"]
+    assert store.delete_issue_management_items([proposal["proposal_id"]]) == {"deleted": 1}
+    assert store.issue_management_items() == []
+
+    records = yaml.safe_load(store_module.ISSUE_MANAGEMENT.read_text(encoding="utf-8"))["items"]
+    assert records[proposal["proposal_id"]]["status"] == "deleted"
+    assert records[proposal["proposal_id"]]["events"][-1]["type"] == "deleted"
+    assert store.delete_issue_management_items([proposal["proposal_id"]]) == {"deleted": 0}
 
 
 def test_legacy_saved_runner_is_planned_with_canonical_phases(tmp_path, monkeypatch):
@@ -806,7 +1031,46 @@ def test_supervisor_result_normalizes_a_numeric_string_score():
     assert result["evaluation"]["score"] == 8.0
 
 
-def test_supervisor_result_accepts_a_structured_ai_behavior_trace():
+def test_supervisor_result_accepts_a_persona_journey_trace():
+    result = store_module.ConsoleStore._validated_supervisor_result(
+        '{"evaluation":{"score":8,"approval":"pending","summary":"ok","behavior_trace":'
+        '{"persona_goal":"I want to confirm my account is usable",'
+        '"current_action":"I checked whether my balance and holdings agree",'
+        '"decision":"I decided not to make a change while they disagree",'
+        '"next_action":"I will wait for the balance, then check my holdings",'
+        '"evidence":"The visible balance is still loading"}},'
+        '"improvements":[],"reported_issues":[]}'
+    )
+    assert (
+        result["evaluation"]["behavior_trace"]["current_action"]
+        == "I checked whether my balance and holdings agree"
+    )
+
+
+def test_supervisor_result_accepts_a_compact_persona_trace_for_existing_runs():
+    result = store_module.ConsoleStore._validated_supervisor_result(
+        '{"evaluation":{"score":8,"approval":"pending","summary":"ok","behavior_trace":'
+        '{"persona_goal":"I want to confirm my account is usable",'
+        '"current_action":"I decided to wait for the balance",'
+        '"next_action":"I will check my holdings",'
+        '"evidence":"The visible balance is still loading"}},'
+        '"improvements":[],"reported_issues":[]}'
+    )
+    assert result["evaluation"]["behavior_trace"]["current_action"] == "I decided to wait for the balance"
+
+
+def test_supervisor_result_accepts_an_expanded_persona_trace_for_existing_runs():
+    result = store_module.ConsoleStore._validated_supervisor_result(
+        '{"evaluation":{"score":8,"approval":"pending","summary":"ok","behavior_trace":'
+        '{"persona_goal":"Confirm the account is usable","expectation":"A visible balance",'
+        '"interpretation":"I cannot confirm my balance yet","evidence":"The balance is still loading",'
+        '"impact":"I cannot safely continue","next_step":"Wait for the balance, then check the holdings"}},'
+        '"improvements":[],"reported_issues":[]}'
+    )
+    assert result["evaluation"]["behavior_trace"]["interpretation"] == "I cannot confirm my balance yet"
+
+
+def test_supervisor_result_accepts_a_legacy_behavior_trace_for_existing_runs():
     result = store_module.ConsoleStore._validated_supervisor_result(
         '{"evaluation":{"score":8,"approval":"pending","summary":"ok","behavior_trace":'
         '{"purpose":"Verify recovery","rationale":"The prior attempt timed out","observation":"A retry completed",'
@@ -1119,6 +1383,60 @@ def test_runner_templates_can_be_imported_into_app_data(tmp_path, monkeypatch):
     assert (tmp_path / "runner-templates" / "shared-browser-check.json").exists()
 
 
+def test_build_star_is_persisted_without_changing_other_build_fields(tmp_path, monkeypatch):
+    monkeypatch.setattr(store_module, "CONFIG", tmp_path)
+    (tmp_path / "builds.yaml").write_text(
+        "- id: starred-build\n  name: Starred build\n  enabled: true\n  repository: ''\n",
+        encoding="utf-8",
+    )
+
+    updated = store_module.ConsoleStore().set_build_star("starred-build", True)
+
+    assert updated["starred"] is True
+    saved = yaml.safe_load((tmp_path / "builds.yaml").read_text(encoding="utf-8"))[0]
+    assert saved["starred"] is True
+    assert saved["name"] == "Starred build"
+    assert saved["enabled"] is True
+
+
+def test_build_state_exposes_sdk_managed_state(tmp_path, monkeypatch):
+    monkeypatch.setattr(store_module, "CONFIG", tmp_path / "config")
+    monkeypatch.setattr(store_module, "APP_DATA", tmp_path / "app-data")
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / "builds.yaml").write_text(
+        "- id: persona-quality\n  name: Persona quality\n  enabled: true\n  repository: ''\n",
+        encoding="utf-8",
+    )
+    state_dir = (
+        tmp_path / "app-data" / "runner-state" / "persona-quality" / "runners" / "persona-journey-runner"
+    )
+    state_dir.mkdir(parents=True)
+    (state_dir / "persona-journey.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "updated_at": "2026-09-14T00:00:00+00:00",
+                "run_id": "run-1",
+                "iteration": 2,
+                "value": {"personas": {"haruka": {"stage": 2}}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert store_module.ConsoleStore().build_state("persona-quality") == [
+        {
+            "name": "persona-journey",
+            "scope": "runner",
+            "runner_id": "persona-journey-runner",
+            "updated_at": "2026-09-14T00:00:00+00:00",
+            "run_id": "run-1",
+            "iteration": 2,
+            "value": {"personas": {"haruka": {"stage": 2}}},
+        }
+    ]
+
+
 def test_manager_prompt_template_can_be_updated(tmp_path, monkeypatch):
     monkeypatch.setattr(store_module, "CONFIG", tmp_path)
     (tmp_path / "prompt-templates.yaml").write_text(
@@ -1193,7 +1511,7 @@ def test_proposal_history_is_derived_from_evaluation_run_results(tmp_path, monke
                     "recorded_at": "2026-01-01T00:00:00+00:00",
                     "response": {
                         "improvements": [
-                            {"title": "Keep evidence", "target": "prompt", "status": "adopted"},
+                            {"title": "Keep evidence", "target": "prompt", "status": "acceptable"},
                             {"title": "Remove noise", "target": "runner", "status": "proposed"},
                         ],
                         "reported_issues": [],
@@ -1203,7 +1521,7 @@ def test_proposal_history_is_derived_from_evaluation_run_results(tmp_path, monke
         )
     )
     lifecycle = store.proposal_lifecycles("build-1")
-    assert [item["status"] for item in lifecycle] == ["accepted", "proposed"]
+    assert [item["status"] for item in lifecycle] == ["acceptable", "proposed"]
     assert {item["title"] for item in lifecycle} == {"Keep evidence", "Remove noise"}
     assert lifecycle[0]["data_files"] == [
         {
@@ -1226,6 +1544,7 @@ def test_proposal_history_is_derived_from_evaluation_run_results(tmp_path, monke
                     "filename": "evidence.json",
                     "path": "/tmp/orbit/evidence.json",
                     "relative_path": "evidence.json",
+                    "content_type": "",
                 }
             ],
         }
@@ -1363,5 +1682,23 @@ def test_manager_output_language_is_injected_into_the_assembled_prompt(tmp_path,
         encoding="utf-8",
     )
     _, prompt = store._assembled_prompt({"manager_template_id": "manager-default-v1", "repository": "test"})
-    assert "configured application language (ja)" in prompt
+    assert "Japanese (ja)" in prompt
     assert store_module.MANAGER_OUTPUT_LANGUAGE_SLOT not in prompt
+
+
+def test_run_output_language_overrides_the_shared_application_setting(tmp_path, monkeypatch):
+    monkeypatch.setattr(store_module, "SETTINGS", tmp_path / "settings.json")
+    monkeypatch.setattr(store_module, "CONFIG", tmp_path / "config")
+    store = store_module.ConsoleStore()
+    store.save_application_settings({"manager_output_locale": "en"})
+    (tmp_path / "config").mkdir(exist_ok=True)
+    (tmp_path / "config" / "prompt-templates.yaml").write_text(
+        "- id: manager-default-v1\n  name: Default\n  version: 1\n  content: Assess evidence.\n",
+        encoding="utf-8",
+    )
+    _, prompt = store._assembled_prompt(
+        {"manager_template_id": "manager-default-v1", "repository": "test"}, "ko"
+    )
+    assert "Korean (ko)" in prompt
+    assert "do not switch to the persona's language" in prompt
+    assert "facts and severity rather than its source-language wording" in prompt

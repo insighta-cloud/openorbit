@@ -42,7 +42,7 @@ type OperationsCopy = {
   description: string;
   tooltip: string;
   feedback: string;
-  accepted: string;
+  acceptable: string;
   issues: string;
   score: string;
   trend: string;
@@ -51,6 +51,20 @@ type OperationsCopy = {
 };
 type DashboardHelp = { trend: string };
 type OverviewCopy = { title: string; description: string };
+type RunUiCopy = {
+  queued: string;
+  awaitingApproval: string;
+  running: string;
+  succeeded: string;
+  failed: string;
+  cancelled: string;
+  beforeAll: string;
+  beforeEach: string;
+  execute: string;
+  verify: string;
+  afterEach: string;
+  afterAll: string;
+};
 
 function DashboardSkeleton() {
   return <>
@@ -109,14 +123,14 @@ function OperationalHealth({ locale }: { locale: Locale }) {
   const trend = useMemo(() => {
     const grouped = new Map<
       string,
-      { time: string; feedback: number; accepted: number }
+      { time: string; feedback: number; acceptable: number }
     >();
     for (const item of analytics?.iteration_trends ?? [])
       for (const point of item.points) {
         const time = new Date(point.recorded_at).toISOString().slice(0, 13);
-        const row = grouped.get(time) ?? { time, feedback: 0, accepted: 0 };
+        const row = grouped.get(time) ?? { time, feedback: 0, acceptable: 0 };
         row.feedback += point.feedback_count;
-        row.accepted += point.accepted_count;
+        row.acceptable += point.acceptable_count;
         grouped.set(time, row);
       }
     return [...grouped.values()].sort((a, b) => a.time.localeCompare(b.time));
@@ -134,7 +148,6 @@ function OperationalHealth({ locale }: { locale: Locale }) {
     <section className="panel dashboard-health">
       <div className="panel-head">
         <div>
-          <p className="eyebrow">IMPROVEMENT RESULTS</p>
           <h2>
             <SectionInfo title={copy.title} description={copy.tooltip} />
           </h2>
@@ -143,7 +156,7 @@ function OperationalHealth({ locale }: { locale: Locale }) {
       </div>
       <div className="dashboard-health-metrics">
         <MetricCard label={copy.feedback} value={`${summary?.feedback ?? 0}`} />
-        <MetricCard label={copy.accepted} value={`${summary?.accepted ?? 0}`} />
+        <MetricCard label={copy.acceptable} value={`${summary?.acceptable ?? 0}`} />
         <MetricCard label={copy.issues} value={`${summary?.issues ?? 0}`} />
         <MetricCard
           label={copy.score}
@@ -182,8 +195,8 @@ function OperationalHealth({ locale }: { locale: Locale }) {
                 radius={[4, 4, 0, 0]}
               />
               <Bar
-                dataKey="accepted"
-                name={copy.accepted}
+                dataKey="acceptable"
+                name={copy.acceptable}
                 fill="#79c99e"
                 radius={[4, 4, 0, 0]}
               />
@@ -217,12 +230,28 @@ export function DashboardPage({
     overview = localeMessages<OverviewCopy>(locale, "dashboardOverview"),
     sectionDetails = localeMessages<Record<string, string>>(locale, "sectionDetails"),
     dashboard = locales[locale].dashboardUi,
+    runUi = locales[locale].runUi as RunUiCopy,
     quickStartLabels = localeMessages<
       Record<string, { name: string; description: string }>
     >(locale, "quickStartLabels"),
     recent = data?.recent_runs ?? [],
     errors = recent.filter((run) => run.status === "failed").length,
     [quickStarts, setQuickStarts] = useState<QuickStart[]>([]);
+  const runLabel = (value: string) =>
+    ({
+      queued: runUi.queued,
+      awaiting_approval: runUi.awaitingApproval,
+      running: runUi.running,
+      succeeded: runUi.succeeded,
+      failed: runUi.failed,
+      cancelled: runUi.cancelled,
+      before_all: runUi.beforeAll,
+      before_each: runUi.beforeEach,
+      execute: runUi.execute,
+      verify: runUi.verify,
+      after_each: runUi.afterEach,
+      after_all: runUi.afterAll,
+    })[value] ?? value;
   useEffect(() => {
     api<QuickStart[]>("/api/quick-starts")
       .then((items) => setQuickStarts(items.slice(0, 4)))
@@ -314,8 +343,15 @@ export function DashboardPage({
             >
               <small>{`${eventLabel} · ${relativeRunTime(eventTime, locale)}`}</small>
               <strong>{run.build_name ?? run.workflow_name}</strong>
-              <span>{run.current_phase ?? run.status}</span>
-              <StatusBadge value={run.status} />
+              <span className="evaluation-card__labels">
+                {run.current_phase && (
+                  <StatusBadge
+                    value={run.current_phase}
+                    label={runLabel(run.current_phase)}
+                  />
+                )}
+                <StatusBadge value={run.status} label={runLabel(run.status)} />
+              </span>
             </button>
           );
         })}

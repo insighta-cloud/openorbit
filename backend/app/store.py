@@ -9,6 +9,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -16,10 +17,12 @@ from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import requests
 import yaml
+from opentelemetry.trace import Status, StatusCode
 
 from orbit import load_bundle
 
@@ -30,6 +33,15 @@ from .providers import AzureOpenAIProvider, BedrockProvider, ModelSettings
 from .remote import RemoteInvocation
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def _telemetry_text_metadata(prefix: str, value: str) -> dict[str, str | int]:
+    """Describe retained model text without exporting its potentially sensitive contents."""
+    encoded = value.encode("utf-8")
+    return {
+        f"{prefix}.length": len(value),
+        f"{prefix}.sha256": hashlib.sha256(encoded).hexdigest(),
+    }
 
 
 def _application_data_pointer() -> Path:
@@ -68,6 +80,7 @@ TARGET_TEST_CASE_SETS = CONFIG / "target-ai-test-case-sets.yaml"
 EXECUTION_ENVIRONMENTS = CONFIG / "execution-environments.yaml"
 TARGET_ENVIRONMENTS = CONFIG / "target-environments.yaml"
 CYCLE_INTERVENTIONS = CONFIG / "cycle-interventions.yaml"
+ISSUE_MANAGEMENT = CONFIG / "issue-management.yaml"
 DEFAULT_OPERATIONAL_MANAGER_PROMPT = """You are an approval-first operations manager for recurring AI evaluations.
 Preserve the task safety boundary, collect observable evidence, and never
 claim success without stated acceptance evidence. Escalate required approvals
@@ -79,11 +92,11 @@ __ORBIT_MANAGER_OUTPUT_LANGUAGE__
 
 Your final response must be exactly one JSON object:
 {
-  \"evaluation\": {\"score\":\"number from 0 to 10\",\"approval\":\"approved|rejected|pending\",\"summary\":\"string\",\"behavior_trace\": {\"purpose\":\"string\",\"rationale\":\"string\",\"observation\":\"string\",\"decision\":\"string\",\"next_action\":\"string\"}, \"behavior_summary\":\"legacy string, only when the evaluated target is an AI\"},
-  \"improvements\": [{\"title\":\"string\",\"status\":\"proposed|adopted|rejected\",\"rationale\":\"string\",\"acceptanceEvidence\":\"string\"}],
+  \"evaluation\": {\"score\":\"number from 0 to 10\",\"approval\":\"approved|rejected|pending\",\"summary\":\"string\",\"behavior_trace\": {\"persona_goal\":\"string\",\"current_action\":\"string\",\"decision\":\"string\",\"next_action\":\"string\",\"evidence\":\"string\"}},
+  \"improvements\": [{\"title\":\"string\",\"status\":\"proposed|acceptable|rejected\",\"rationale\":\"string\",\"acceptanceEvidence\":\"string\"}],
   \"reported_issues\": [{\"title\":\"string\",\"severity\":\"low|medium|high|critical\",\"evidence\":\"string\",\"reproduction\":\"string\",\"status\":\"open|acknowledged|resolved\"}]
 }
-For an evaluated AI, include behavior_trace and fill every field. It is an evidence-backed activity record for a person reviewing the run: purpose explains why this check or action matters now; rationale names only the observable evidence or declared plan behind it; observation records the material change or finding in this iteration; decision records what the target AI did or deliberately did not do; next_action states the specific next check or hypothesis. Compare with the immediately previous iteration when that evidence is supplied. Do not narrate repeated mechanics (navigation, waits, screenshots, or generic control inspection). When there is no material change, say so briefly and make next_action explain how the next check will differ or escalate. Do not reveal hidden reasoning or evaluator chain-of-thought. Do not include behavior_trace for non-AI targets. behavior_summary is optional legacy compatibility only; prefer behavior_trace. Always include both array keys, using empty arrays when there are no items."""
+For an evaluated AI, include behavior_trace and fill every field. This is an evidence-backed persona journey, not the evaluator's procedure and not hidden reasoning. Keep the visible journey concise and written from the persona's perspective: persona_goal is the persona's stable wish; current_action is the one meaningful action taken in this iteration; decision is the resulting judgment or choice; next_action is the one specific, safe next action. Write each field as one to three natural sentences in the selected output language. Follow that language's normal grammar, ellipsis, and point of view; do not mechanically repeat a subject or pronoun across fields. Do not describe navigation, waits, screenshots, generic control inspection, or other repeated mechanics in any visible journey field. evidence is a concise source-backed factual record for the evidence drawer, not a visible journey item. Use the persona's wording where useful, but do not invent motives, feelings, beliefs, or facts beyond the declared persona and observed evidence. Do not reveal hidden reasoning or evaluator chain-of-thought. Do not include behavior_trace for non-AI targets. behavior_summary is deprecated and should be omitted. Always include both array keys, using empty arrays when there are no items."""
 LEGACY_OPERATIONAL_MANAGER_PROMPT = """You are an approval-first operations manager for recurring AI evaluations.
 Preserve the task safety boundary, collect observable evidence, and never
 claim success without stated acceptance evidence. Escalate required approvals
@@ -94,13 +107,13 @@ __ORBIT_MANAGER_AI_PROMPT__
 Your final response must be exactly one JSON object:
 {
   \"evaluation\": {\"score\":\"number from 0 to 10\",\"approval\":\"approved|rejected|pending\",\"summary\":\"string\",\"behavior_summary\":\"string, only when the evaluated target is an AI\"},
-  \"improvements\": [{\"title\":\"string\",\"status\":\"proposed|adopted|rejected\",\"rationale\":\"string\",\"acceptanceEvidence\":\"string\"}],
+  \"improvements\": [{\"title\":\"string\",\"status\":\"proposed|acceptable|rejected\",\"rationale\":\"string\",\"acceptanceEvidence\":\"string\"}],
   \"reported_issues\": [{\"title\":\"string\",\"severity\":\"low|medium|high|critical\",\"evidence\":\"string\",\"reproduction\":\"string\",\"status\":\"open|acknowledged|resolved\"}]
 }
 Include behavior_summary only when the evaluated target is an AI. It must describe the AI's observed responses, decisions, tool use, refusals, or other behavior in plain language; do not describe pass/fail outcomes, metrics, baselines, or the evaluator's actions. Omit behavior_summary for non-AI targets. Always include both array keys, using empty arrays when there are no items."""
 PROPOSAL_DECISION_POLICY = """# Improvement decision policy
 Decide each improvement status independently from the evaluation approval score.
-Use `adopted` for a prompt-only change when it is low-risk, additive, reversible through the retained prompt version, directly supported by the observed evidence, and has measurable acceptance evidence. Prefer `adopted` for such changes; do not defer it merely to wait for another iteration or a repeated candidate fingerprint.
+Use `acceptable` for a prompt-only change when it is low-risk, additive, reversible through the retained prompt version, directly supported by the observed evidence, and has measurable acceptance evidence. Prefer `acceptable` for such changes; do not defer it merely to wait for another iteration or a repeated candidate fingerprint.
 Use `proposed` when the change needs code, infrastructure, product, security, or human-policy approval, or when the evidence is insufficient. Use `rejected` for unsafe, duplicate, or unsupported changes."""
 MANAGER_PROMPT_SLOT = "__ORBIT_MANAGER_AI_PROMPT__"
 MANAGER_OUTPUT_LANGUAGE_SLOT = "__ORBIT_MANAGER_OUTPUT_LANGUAGE__"
@@ -108,7 +121,7 @@ NATIVE_IMPROVEMENT_CYCLE_TEMPLATE = r"""# Requirements
 # - PROJECT_ROOT is a Git repository.
 # - The build selects fixed target-AI prompts and a configured model
 #   profile, plus a readable managed_prompt_path on its Target Environment.
-# - Only supervisor feedback explicitly marked adopted is applied to the prompt.
+# - Only human-accepted feedback is applied to the prompt.
 # This runner never commits target changes; ctx.update_file keeps rollback versions.
 
 import hashlib
@@ -229,11 +242,11 @@ def before_each(ctx):
     # Keep the target's complete pre-evaluation state outside commit history.
     # The call is idempotent because before_each runs for every iteration.
     ctx.save_before_each_snapshot()
-    # Apply the latest accepted supervisor feedback before the next validation.
+    # Apply only feedback accepted by a human before the next validation.
     feedback = ctx.previous_supervisor_feedback
     accepted = [
         proposal for proposal in feedback.get("improvements", [])
-        if isinstance(proposal, dict) and str(proposal.get("status") or "").lower() in {"adopted", "accepted"}
+        if isinstance(proposal, dict) and str(proposal.get("status") or "").lower() == "accepted"
     ]
     requires_human_approval = bool(
         ctx.build.get("require_human_approval_before_apply", False)
@@ -497,7 +510,12 @@ def adapter_command():
 
 
 def invoke(ctx, action):
-    return ctx.exec([*adapter_command(), action], cwd=ORBIT_PROJECT_PATH(), timeout=3600)
+    return ctx.exec(
+        [*adapter_command(), action],
+        cwd=ORBIT_PROJECT_PATH(),
+        timeout=3600,
+        target_log_source="external-adapter",
+    )
 
 
 @graph.step("check-adapter", title="Check adapter readiness", phase="before_all", outputs=["adapter_status"])
@@ -596,6 +614,7 @@ def invoke(ctx, action):
         cwd=ctx.project_root,
         timeout=3600,
         env={"ORBIT_CYCLE_INPUT": cycle_input(ctx, action)},
+        target_log_source="external-agent",
     )
     try:
         result = json.loads(output)
@@ -717,6 +736,7 @@ def invoke(ctx, action):
         cwd=ctx.project_root,
         timeout=3600,
         env={"ORBIT_CYCLE_INPUT": cycle_input(ctx, action)},
+        target_log_source="evidence-probe",
     )
     try:
         result = json.loads(output)
@@ -838,6 +858,7 @@ class ConsoleStore:
         RUNNER_TEMPLATES.mkdir(parents=True, exist_ok=True)
         QUICK_STARTS.mkdir(parents=True, exist_ok=True)
         self._migrate_build_environments()
+        self._migrate_target_log_forwarding()
         self._processes: dict[str, subprocess.Popen[str]] = {}
         # Test runs are deliberately process-local: they support the build-page
         # test dialog without becoming an evaluation-run record or surviving a
@@ -1190,7 +1211,22 @@ if __name__ == "__main__": runner.main()
                             {
                                 "behavior_trace": display_fields(
                                     behavior_trace,
-                                    ("purpose", "rationale", "observation", "decision", "next_action"),
+                                    (
+                                        "persona_goal",
+                                        "current_action",
+                                        "decision",
+                                        "next_action",
+                                        "evidence",
+                                        "expectation",
+                                        "interpretation",
+                                        "impact",
+                                        "next_step",
+                                        "purpose",
+                                        "rationale",
+                                        "observation",
+                                        "decision",
+                                        "next_action",
+                                    ),
                                 )
                             }
                             if isinstance(behavior_trace, dict)
@@ -1735,7 +1771,7 @@ if __name__ == "__main__":
                     "prompt_template": {
                         "name": "${build_name} policy",
                         "version": 1,
-                        "content": "Evaluate the managed agent prompt strictly against retained responses from the real target AI. Compare each response with its fixed user request and acceptance criterion. Check scope and task clarity; grounding in observable product evidence; uncertainty and missing-context handling; safety and refusal boundaries; and an actionable next step. For every unmet criterion observed in an actual response, return one concrete, non-duplicative prompt improvement with validation and rollback evidence. Never repeat an instruction already present in the managed prompt or its accepted-proposals block. Mark a low-risk, additive, reversible prompt-only improvement adopted only when it is directly supported by the observed response and has measurable response-level acceptance evidence. Keep code, infrastructure, policy, or insufficiently evidenced changes proposed. Return empty arrays only when every criterion is demonstrably met.",
+                        "content": "Evaluate the managed agent prompt strictly against retained responses from the real target AI. Compare each response with its fixed user request and acceptance criterion. Check scope and task clarity; grounding in observable product evidence; uncertainty and missing-context handling; safety and refusal boundaries; and an actionable next step. For every unmet criterion observed in an actual response, return one concrete, non-duplicative prompt improvement with validation and rollback evidence. Never repeat an instruction already present in the managed prompt or its accepted-proposals block. Mark a low-risk, additive, reversible prompt-only improvement acceptable only when it is directly supported by the observed response and has measurable response-level acceptance evidence. Keep code, infrastructure, policy, or insufficiently evidenced changes proposed. Return empty arrays only when every criterion is demonstrably met.",
                     },
                     "test_case_set": {
                         "name": "${build_name} validation",
@@ -2239,10 +2275,14 @@ if __name__ == "__main__":
     def update_runner(self, runner_id: str, values: dict[str, str]) -> dict[str, str]:
         existing = self._runner(runner_id)
         return self._write_runner(
-            runner_id, {**existing, **{key: value for key, value in values.items() if value is not None}}
+            runner_id,
+            {**existing, **{key: value for key, value in values.items() if value is not None}},
+            bundle=bool(existing.get("bundle")),
         )
 
-    def _write_runner(self, runner_id: str, values: dict[str, str]) -> dict[str, str]:
+    def _write_runner(
+        self, runner_id: str, values: dict[str, str], *, bundle: bool = False
+    ) -> dict[str, str]:
         source = self._canonicalize_runner_source(str(values["source"]))
         compile(source, f"{runner_id}.py", "exec")
         existing_versions = list(values.get("versions") or [])
@@ -2264,7 +2304,12 @@ if __name__ == "__main__":
         }
         if not asset["name"] or not asset["description"]:
             raise ValueError("runner requires a name and description")
-        source_path, metadata_path = RUNNERS / f"{runner_id}.py", RUNNERS / f"{runner_id}.json"
+        source_path, metadata_path = (
+            (RUNNERS / runner_id / "runner.py", RUNNERS / runner_id / "runner.json")
+            if bundle
+            else (RUNNERS / f"{runner_id}.py", RUNNERS / f"{runner_id}.json")
+        )
+        source_path.parent.mkdir(parents=True, exist_ok=True)
         source_path.write_text(source, encoding="utf-8")
         metadata_path.write_text(json.dumps(asset, indent=2), encoding="utf-8")
         return {**asset, "source": source}
@@ -2351,6 +2396,20 @@ if __name__ == "__main__":
         self, runner_id: str, repository: str | None, runner_version: int | None = None
     ) -> dict[str, Any] | None:
         """Read the runner's optional visual-workflow declaration safely."""
+        return self._runner_graph_from_entry(self._runner_entry_path(runner_id, runner_version), repository)
+
+    def preview_runner_graph(self, source: str) -> dict[str, Any] | None:
+        """Build a visual workflow from unsaved runner source without retaining it."""
+        source = self._canonicalize_runner_source(source)
+        compile(source, "runner-preview.py", "exec")
+        with tempfile.TemporaryDirectory(prefix="orbit-runner-graph-") as directory:
+            entry = Path(directory) / "runner.py"
+            entry.write_text(source, encoding="utf-8")
+            return self._runner_graph_from_entry(entry, None)
+
+    @staticmethod
+    def _runner_graph_from_entry(entry: Path, repository: str | None) -> dict[str, Any] | None:
+        """Execute one runner's graph-only entrypoint and validate its response."""
         environment = os.environ.copy()
         environment["PYTHONPATH"] = str(ROOT / "backend") + (
             os.pathsep + environment["PYTHONPATH"] if environment.get("PYTHONPATH") else ""
@@ -2359,7 +2418,7 @@ if __name__ == "__main__":
         environment["ORBIT_APP_DATA"] = str(APP_DATA)
         try:
             result = subprocess.run(
-                [sys.executable, str(self._runner_entry_path(runner_id, runner_version)), "--graph"],
+                [sys.executable, str(entry), "--graph"],
                 cwd=repository or ROOT,
                 text=True,
                 stdout=subprocess.PIPE,
@@ -2389,6 +2448,7 @@ if __name__ == "__main__":
             # Existing builds predate this optional policy, so leave it off
             # unless an operator explicitly enabled it.
             build.setdefault("require_human_approval_before_apply", False)
+            build.setdefault("starred", False)
             self._hydrate_build_environment(build)
             build.update(self._repository_metadata(str(build.get("repository", ""))))
             build.setdefault("created_at", fallback)
@@ -2667,6 +2727,68 @@ if __name__ == "__main__":
             self._save_asset_list(TARGET_ENVIRONMENTS, targets)
             self._save_asset_list(path, builds)
 
+    @staticmethod
+    def _add_target_log_forwarding(source: str, *, command_marker: str, log_source: str) -> str:
+        """Add Target Log forwarding only to a known external-command contract."""
+        if command_marker not in source or "target_log_source=" in source:
+            return source
+        multiline = re.compile(r"^(?P<indent>[ \t]*)timeout=(?:3600|3_600),$", re.MULTILINE)
+        if multiline.search(source):
+            return multiline.sub(
+                lambda match: f'{match.group(0)}\n{match.group("indent")}target_log_source="{log_source}",',
+                source,
+                count=1,
+            )
+        for timeout in ("timeout=3600", "timeout=3_600"):
+            legacy = f"{timeout})"
+            if legacy in source:
+                return source.replace(legacy, f'{timeout}, target_log_source="{log_source}")')
+        return source
+
+    def _migrate_target_log_forwarding(self) -> None:
+        """Version legacy external runners so their child output reaches Target Logs.
+
+        Native runners also use ``ctx.exec`` for internal Git/configuration work.
+        This migration intentionally limits itself to the explicit external command
+        templates, leaving custom and native runner behavior unchanged.
+        """
+        migrations = {
+            "external-command-adapter": ("ORBIT_ADAPTER_COMMAND", "external-adapter"),
+            "json-agent-cycle": ("ORBIT_AGENT_COMMAND", "external-agent"),
+            "evidence-gated-probe-cycle": ("ORBIT_PROBE_COMMAND", "evidence-probe"),
+            "selenium-external-journey": ("ORBIT_SELENIUM_COMMAND", "selenium-adapter"),
+        }
+
+        for runner in self.runners():
+            migration = migrations.get(str(runner.get("template_id", "")))
+            if migration is None:
+                continue
+            source = self._add_target_log_forwarding(
+                runner["source"], command_marker=migration[0], log_source=migration[1]
+            )
+            if source != runner["source"]:
+                self._write_runner(
+                    runner["id"], {**runner, "source": source}, bundle=bool(runner.get("bundle"))
+                )
+
+        # Imported templates have no immutable version history. Restrict this
+        # content-aware update to the same known external contracts so a user's
+        # unrelated template is never rewritten.
+        for path in RUNNER_TEMPLATES.glob("*.py"):
+            metadata = path.with_suffix(".json")
+            if not metadata.exists():
+                continue
+            template_id = str(json.loads(metadata.read_text(encoding="utf-8")).get("id", ""))
+            migration = migrations.get(template_id)
+            if migration is None:
+                continue
+            source = path.read_text(encoding="utf-8")
+            updated = self._add_target_log_forwarding(
+                source, command_marker=migration[0], log_source=migration[1]
+            )
+            if updated != source:
+                path.write_text(updated, encoding="utf-8")
+
     def prompt_templates(self) -> list[dict[str, Any]]:
         path = CONFIG / "prompt-templates.yaml"
         templates = yaml.safe_load(path.read_text(encoding="utf-8")) if path.exists() else []
@@ -2839,7 +2961,7 @@ if __name__ == "__main__":
         temporary.replace(CONFIG / "prompt-templates.yaml")
         return template
 
-    def _assembled_prompt(self, build: dict[str, Any]) -> tuple[str, str]:
+    def _assembled_prompt(self, build: dict[str, Any], output_locale: str | None = None) -> tuple[str, str]:
         """Resolve the global manager contract and the build's evaluation policy."""
         template_id = build.get("manager_template_id", "manager-default-v1")
         template = next((item for item in self.prompt_templates() if item.get("id") == template_id), None)
@@ -2885,15 +3007,27 @@ if __name__ == "__main__":
             )
             if part
         )
+        resolved_output_locale = (
+            str(output_locale or self.application_settings()["manager_output_locale"]).strip() or "en"
+        )
+        output_language_name = {
+            "en": "English",
+            "ja": "Japanese",
+            "ko": "Korean",
+        }.get(resolved_output_locale.lower().split("-", 1)[0], resolved_output_locale)
         assembled = "\n\n".join(
             part
             for part in (
                 operational.replace(MANAGER_PROMPT_SLOT, manager_policy).replace(
                     MANAGER_OUTPUT_LANGUAGE_SLOT,
                     "# Output language\n"
-                    "Write all human-readable string values in the configured application language "
-                    f"({self.application_settings()['manager_output_locale']}). "
-                    "Keep JSON keys, field names, and required enum values exactly as specified.",
+                    "Write every human-readable JSON string value in "
+                    f"{output_language_name} ({resolved_output_locale}). "
+                    "This applies even when the persona, rendered UI, or source evidence uses another language; "
+                    "do not switch to the persona's language for behavior_trace, summaries, improvements, or issues. "
+                    "If another instruction asks you to preserve an issue title, evidence, or reproduction, "
+                    "preserve its facts and severity rather than its source-language wording. "
+                    "Keep JSON keys, field names, required enum values, and verbatim UI strings quoted as evidence exactly as specified.",
                 ),
                 f"# Evaluation context\nRepository: {build.get('repository', '')}\n{legacy_context}",
                 case_text,
@@ -2908,6 +3042,40 @@ if __name__ == "__main__":
             if build["id"] == build_id:
                 return build
         raise KeyError(build_id)
+
+    def build_state(self, build_id: str) -> list[dict[str, Any]]:
+        """Expose a build's SDK-managed state without treating it as run evidence."""
+        self.build(build_id)
+        root = APP_DATA / "runner-state" / build_id
+        if not root.is_dir():
+            return []
+        states = []
+        directories = [("build", None, root / "build")]
+        runners = root / "runners"
+        if runners.is_dir():
+            directories.extend(
+                ("runner", path.name, path) for path in sorted(runners.iterdir()) if path.is_dir()
+            )
+        for scope, runner_id, directory in directories:
+            for path in sorted(directory.glob("*.json")):
+                try:
+                    document = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    continue
+                if not isinstance(document, dict) or document.get("schema_version") != 1:
+                    continue
+                states.append(
+                    {
+                        "name": path.stem,
+                        "scope": scope,
+                        "runner_id": runner_id,
+                        "updated_at": document.get("updated_at"),
+                        "run_id": document.get("run_id"),
+                        "iteration": document.get("iteration"),
+                        "value": document.get("value"),
+                    }
+                )
+        return sorted(states, key=lambda item: str(item.get("updated_at") or ""), reverse=True)
 
     def workspaces(self, path: str | None = None) -> dict[str, Any]:
         if path is None:
@@ -2963,6 +3131,7 @@ if __name__ == "__main__":
             "id": build_id,
             "name": values["name"],
             "enabled": values["enabled"],
+            "starred": False,
             "runner_id": runner["id"],
             "runner_version": int(runner_version) if runner_version is not None else None,
             "execution_environment_id": execution_environment.get("id", ""),
@@ -3049,6 +3218,7 @@ if __name__ == "__main__":
             "id": build_id,
             "name": values["name"],
             "enabled": values["enabled"],
+            "starred": bool(existing.get("starred", False)),
             "runner_id": runner["id"],
             "runner_version": int(runner_version) if runner_version is not None else None,
             "execution_environment_id": execution_environment.get("id", ""),
@@ -3091,6 +3261,17 @@ if __name__ == "__main__":
         temporary.write_text(yaml.safe_dump(builds, allow_unicode=True, sort_keys=False), encoding="utf-8")
         temporary.replace(CONFIG / "builds.yaml")
         return build
+
+    def set_build_star(self, build_id: str, starred: bool) -> dict[str, Any]:
+        builds = self.builds()
+        index = next((i for i, build in enumerate(builds) if build["id"] == build_id), None)
+        if index is None:
+            raise KeyError(build_id)
+        builds[index]["starred"] = starred
+        temporary = CONFIG / "builds.tmp"
+        temporary.write_text(yaml.safe_dump(builds, allow_unicode=True, sort_keys=False), encoding="utf-8")
+        temporary.replace(CONFIG / "builds.yaml")
+        return builds[index]
 
     def delete_build(self, build_id: str) -> None:
         builds = self.builds()
@@ -3159,6 +3340,19 @@ if __name__ == "__main__":
                 response = record.get("response")
                 if not isinstance(response, dict):
                     continue
+                personas: list[str] = []
+                for step in run.step_results:
+                    if not isinstance(step, dict) or step.get("loop_index") != iteration:
+                        continue
+                    result = step.get("result")
+                    if not isinstance(result, dict):
+                        continue
+                    cycle = result.get("insighta_persona_simulator") or result.get("persona_cycle")
+                    if not isinstance(cycle, dict):
+                        continue
+                    for persona in cycle.get("active_personas", []) or cycle.get("processed_personas", []):
+                        if isinstance(persona, str) and persona not in personas:
+                            personas.append(persona)
                 improvements = response.get("improvements", [])
                 evaluation = response.get("evaluation")
                 score = evaluation.get("score") if isinstance(evaluation, dict) else None
@@ -3173,6 +3367,8 @@ if __name__ == "__main__":
                     decision = (
                         "accepted"
                         if source_status in {"adopted", "accepted"}
+                        else "acceptable"
+                        if source_status == "acceptable"
                         else "rejected"
                         if source_status == "rejected"
                         else "pending"
@@ -3193,6 +3389,7 @@ if __name__ == "__main__":
                             "build_name": run.build_name,
                             "run_id": run.id,
                             "iteration": iteration,
+                            "personas": personas,
                             "recorded_at": record.get("recorded_at") or run.updated_at.isoformat(),
                             "data_files": data_files,
                             "prompt_version": None,
@@ -3214,6 +3411,106 @@ if __name__ == "__main__":
         if status:
             values = [item for item in values if item["status"] == status or item["decision"] == status]
         return sorted(values, key=lambda item: str(item.get("recorded_at", "")), reverse=True)
+
+    def _issue_management_records(self) -> dict[str, dict[str, Any]]:
+        try:
+            values = yaml.safe_load(ISSUE_MANAGEMENT.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}
+        if not isinstance(values, dict) or not isinstance(values.get("items"), dict):
+            return {}
+        return {
+            key: value
+            for key, value in values["items"].items()
+            if isinstance(key, str) and isinstance(value, dict)
+        }
+
+    def _save_issue_management_records(self, values: dict[str, dict[str, Any]]) -> None:
+        CONFIG.mkdir(parents=True, exist_ok=True)
+        temporary = ISSUE_MANAGEMENT.with_suffix(".tmp")
+        temporary.write_text(
+            yaml.safe_dump({"schema_version": 1, "items": values}, allow_unicode=True, sort_keys=False),
+            encoding="utf-8",
+        )
+        temporary.replace(ISSUE_MANAGEMENT)
+
+    def issue_management_items(self) -> list[dict[str, Any]]:
+        records = self._issue_management_records()
+        values = []
+        for proposal in self.proposal_lifecycles():
+            record = records.get(proposal["proposal_id"], {})
+            # Issues are derived from immutable run evidence. A deletion is a
+            # management-level tombstone, not deletion of the underlying run.
+            if record.get("status") == "deleted":
+                continue
+            values.append(
+                {
+                    **proposal,
+                    "management_status": record.get("status", "unreviewed"),
+                    "assigner": record.get("assigner", ""),
+                    "comments": record.get("comments", []),
+                    "management_events": record.get("events", []),
+                }
+            )
+        return values
+
+    def update_issue_management_item(
+        self,
+        proposal_id: str,
+        *,
+        status: str | None = None,
+        comment: str = "",
+        assigner: str = "",
+        verification_run_id: str = "",
+    ) -> dict[str, Any]:
+        item = next(
+            (value for value in self.issue_management_items() if value["proposal_id"] == proposal_id), None
+        )
+        if item is None:
+            raise KeyError(proposal_id)
+        if status not in {None, "unreviewed", "reviewing", "in_progress", "resolved", "deferred"}:
+            raise ValueError("invalid issue management status")
+        comment = comment.strip()
+        assigner = assigner.strip()
+        records = self._issue_management_records()
+        record = records.setdefault(proposal_id, {"status": "unreviewed", "comments": [], "events": []})
+        timestamp = now().isoformat()
+        if status and status != record.get("status"):
+            record["status"] = status
+            record["events"].append({"type": "status", "status": status, "recorded_at": timestamp})
+        if comment:
+            entry = {"body": comment, "recorded_at": timestamp}
+            if assigner:
+                entry["assigner"] = assigner
+                record["assigner"] = assigner
+            if verification_run_id.strip():
+                entry["verification_run_id"] = verification_run_id.strip()
+            record["comments"].append(entry)
+            record["events"].append({"type": "comment", **entry})
+        self._save_issue_management_records(records)
+        return next(value for value in self.issue_management_items() if value["proposal_id"] == proposal_id)
+
+    def delete_issue_management_items(self, proposal_ids: list[str]) -> dict[str, int]:
+        """Soft-delete issue-management rows while retaining run evidence and audit history."""
+        identifiers = list(dict.fromkeys(str(value).strip() for value in proposal_ids if str(value).strip()))
+        if not identifiers:
+            raise ValueError("at least one issue-management item is required")
+        available = {item["proposal_id"] for item in self.proposal_lifecycles()}
+        missing = [proposal_id for proposal_id in identifiers if proposal_id not in available]
+        if missing:
+            raise KeyError(missing[0])
+        records = self._issue_management_records()
+        timestamp = now().isoformat()
+        deleted = 0
+        for proposal_id in identifiers:
+            record = records.setdefault(proposal_id, {"status": "unreviewed", "comments": [], "events": []})
+            if record.get("status") == "deleted":
+                continue
+            record["status"] = "deleted"
+            record.setdefault("events", []).append({"type": "deleted", "recorded_at": timestamp})
+            deleted += 1
+        self._save_issue_management_records(records)
+        return {"deleted": deleted}
 
     def improvement_iteration_data(self, build_id: str | None = None) -> list[dict[str, Any]]:
         """List SDK-saved data files by persisted evaluation run and iteration.
@@ -3245,6 +3542,7 @@ if __name__ == "__main__":
                             "filename": filename,
                             "path": path,
                             "relative_path": str(data_file.get("relative_path") or ""),
+                            "content_type": str(data_file.get("content_type") or ""),
                         }
                     )
                     timestamps.setdefault(iteration, str(step.get("ended_at") or run.updated_at.isoformat()))
@@ -3648,13 +3946,21 @@ if __name__ == "__main__":
 
     def improvement_analytics(self, hours: int = 24) -> dict[str, Any]:
         """Aggregate retained supervisor feedback into operator-facing trends."""
-        hours = max(1, min(hours, 24 * 30))
+        requested_hours = max(0, hours)
         end = now()
-        start = end - timedelta(hours=hours)
+        pipeline_runs = [run for run in self.runs() if run.execution_type == "pipeline" and run.build_id]
+        start = (
+            end - timedelta(hours=min(requested_hours, 24 * 30))
+            if requested_hours
+            else min((run.created_at for run in pipeline_runs), default=end - timedelta(hours=24))
+        )
         feedback_by_build: dict[str, dict[str, Any]] = {}
         trends_by_build: dict[str, dict[str, Any]] = {}
         feedback_status_by_build: dict[str, dict[str, Any]] = {}
-        bucket_count = min(24, max(6, hours))
+        bucket_count = min(
+            24,
+            max(6, int(max(1, (end - start).total_seconds() / 3600))),
+        )
         interval = timedelta(seconds=(end - start).total_seconds() / bucket_count)
         issue_severity = [
             {"time": (start + interval * index).isoformat(), "low": 0, "medium": 0, "high": 0, "critical": 0}
@@ -3664,7 +3970,7 @@ if __name__ == "__main__":
         previous_summary_start = summary_start - timedelta(hours=24)
         summary = {
             "feedback": 0,
-            "accepted": 0,
+            "acceptable": 0,
             "issues": 0,
             "scores": [],
             "previous_scores": [],
@@ -3678,7 +3984,6 @@ if __name__ == "__main__":
             except ValueError:
                 return None
 
-        pipeline_runs = [run for run in self.runs() if run.execution_type == "pipeline" and run.build_id]
         for run in pipeline_runs:
             build_id = str(run.build_id)
             name = run.build_name or build_id
@@ -3687,7 +3992,7 @@ if __name__ == "__main__":
             )
             trend = trends_by_build.setdefault(build_id, {"build_id": build_id, "name": name, "points": []})
             status_counts = feedback_status_by_build.setdefault(
-                build_id, {"build_id": build_id, "name": name, "proposed": 0, "adopted": 0, "rejected": 0}
+                build_id, {"build_id": build_id, "name": name, "proposed": 0, "acceptable": 0, "rejected": 0}
             )
             for record in run.supervisor_results:
                 recorded_at = parse_timestamp(record.get("recorded_at"))
@@ -3708,11 +4013,11 @@ if __name__ == "__main__":
                 score = evaluation.get("score") if isinstance(evaluation.get("score"), (int, float)) else None
                 if recorded_at >= summary_start:
                     summary["feedback"] += len(improvements) + len(issues)
-                    summary["accepted"] += len(
+                    summary["acceptable"] += len(
                         [
                             item
                             for item in improvements
-                            if isinstance(item, dict) and item.get("status") == "adopted"
+                            if isinstance(item, dict) and item.get("status") == "acceptable"
                         ]
                     )
                     summary["issues"] += len(issues)
@@ -3726,7 +4031,7 @@ if __name__ == "__main__":
                 for improvement in improvements:
                     if isinstance(improvement, dict) and improvement.get("status") in {
                         "proposed",
-                        "adopted",
+                        "acceptable",
                         "rejected",
                     }:
                         status_counts[str(improvement["status"])] += 1
@@ -3746,11 +4051,11 @@ if __name__ == "__main__":
                         "run_id": run.id,
                         "iteration": record.get("iteration", 0),
                         "recorded_at": recorded_at.isoformat(),
-                        "accepted_count": len(
+                        "acceptable_count": len(
                             [
                                 item
                                 for item in improvements
-                                if isinstance(item, dict) and item.get("status") == "adopted"
+                                if isinstance(item, dict) and item.get("status") == "acceptable"
                             ]
                         ),
                         "feedback_count": len(improvements) + len(issues),
@@ -3808,10 +4113,10 @@ if __name__ == "__main__":
             else None
         )
         return {
-            "window_hours": hours,
+            "window_hours": requested_hours,
             "operational_summary": {
                 "feedback": summary["feedback"],
-                "accepted": summary["accepted"],
+                "acceptable": summary["acceptable"],
                 "issues": summary["issues"],
                 "average_score": average_score,
                 "score_delta": round(average_score - previous_average, 1)
@@ -3876,7 +4181,7 @@ if __name__ == "__main__":
             ]
             item["proposed_improvements"] = len(improvements)
             item["approved_improvements"] = len(
-                [item for item in improvements if item.get("status") == "adopted"]
+                [item for item in improvements if item.get("status") in {"adopted", "accepted"}]
             )
             item["reported_issues"] = len(issues)
             item["approval_score"] = builds_by_id[run.build_id].get("approval_score")
@@ -3899,9 +4204,13 @@ if __name__ == "__main__":
             if run.id in self._test_sessions:
                 self._test_sessions[run.id] = run
                 return
-        temporary = self._path(run.id).with_suffix(".tmp")
-        temporary.write_text(run.model_dump_json(indent=2), encoding="utf-8")
-        temporary.replace(self._path(run.id))
+            # Live output is persisted from a reader thread while the main
+            # execution thread also updates the same Run. Keep the complete
+            # temporary-file replacement atomic per store instance so both
+            # writers cannot race on `<run>.tmp`.
+            temporary = self._path(run.id).with_suffix(".tmp")
+            temporary.write_text(run.model_dump_json(indent=2), encoding="utf-8")
+            temporary.replace(self._path(run.id))
 
     def _load(self, run_id: str) -> Run:
         with self._lock:
@@ -3967,6 +4276,7 @@ if __name__ == "__main__":
         supervisor_profile_name: str | None = None,
         prompt_source: str | None = None,
         prompt_snapshot: str | None = None,
+        output_locale: str | None = None,
         loop_limit: int = 1,
         timezone: str = "UTC",
         schedule_enabled: bool = False,
@@ -4006,6 +4316,7 @@ if __name__ == "__main__":
             build_name=build_name,
             repository=repository,
             supervisor_profile_name=supervisor_profile_name,
+            output_locale=output_locale,
             prompt_source=prompt_source,
             prompt_snapshot=prompt_snapshot,
             execution_mode=execution_mode,
@@ -4265,6 +4576,10 @@ if __name__ == "__main__":
                 "workflow.id": workflow.id,
                 "run.id": run_id,
                 "workflow.kind": workflow.kind,
+                "orbit.execution.mode": run.execution_mode,
+                "orbit.execution.type": run.execution_type,
+                "orbit.loop.limit": run.loop_limit,
+                "orbit.build.id": run.build_id or "",
             },
         ) as workflow_span:
             trace_id = f"{workflow_span.get_span_context().trace_id:032x}"
@@ -4377,6 +4692,8 @@ if __name__ == "__main__":
                     self._execute_step(run_id, step, loop_index, resources, allow_terminal=True)
                 if self._load(run_id).status in {"failed", "cancelled"}:
                     break
+                if run.execution_mode == "run" and self._load(run_id).status == "running":
+                    self._complete_supervision(run_id)
                 if (
                     loop_index < run.loop_limit
                     and run.repeat_interval_minutes
@@ -4506,13 +4823,38 @@ if __name__ == "__main__":
                 raise ValueError("supervisor evaluation behavior_summary is invalid")
             if "behavior_trace" in evaluation:
                 trace = evaluation["behavior_trace"]
-                trace_fields = {"purpose", "rationale", "observation", "decision", "next_action"}
+                persona_journey_trace_fields = {
+                    "persona_goal",
+                    "current_action",
+                    "decision",
+                    "next_action",
+                    "evidence",
+                }
+                compact_persona_trace_fields = {
+                    "persona_goal",
+                    "current_action",
+                    "next_action",
+                    "evidence",
+                }
+                expanded_persona_trace_fields = {
+                    "persona_goal",
+                    "expectation",
+                    "interpretation",
+                    "evidence",
+                    "impact",
+                    "next_step",
+                }
+                legacy_trace_fields = {"purpose", "rationale", "observation", "decision", "next_action"}
                 if (
                     not isinstance(trace, dict)
-                    or set(trace) != trace_fields
-                    or not all(
-                        isinstance(trace[field], str) and trace[field].strip() for field in trace_fields
-                    )
+                    or frozenset(trace)
+                    not in {
+                        frozenset(persona_journey_trace_fields),
+                        frozenset(compact_persona_trace_fields),
+                        frozenset(expanded_persona_trace_fields),
+                        frozenset(legacy_trace_fields),
+                    }
+                    or not all(isinstance(trace[field], str) and trace[field].strip() for field in trace)
                 ):
                     raise ValueError("supervisor evaluation behavior_trace is invalid")
         return result
@@ -4605,7 +4947,7 @@ if __name__ == "__main__":
         supervisor_prompt = run.prompt_snapshot or ""
         if run.build_id:
             try:
-                _, supervisor_prompt = self._assembled_prompt(self.build(run.build_id))
+                _, supervisor_prompt = self._assembled_prompt(self.build(run.build_id), run.output_locale)
             except ValueError:
                 # The original immutable run snapshot remains a safe fallback
                 # if an operator has made the prompt temporarily unreadable.
@@ -4617,16 +4959,24 @@ if __name__ == "__main__":
             "supervisor.evaluate",
             attributes={
                 "run.id": run_id,
+                "gen_ai.operation.name": "chat",
                 "gen_ai.provider.name": settings.provider,
                 "gen_ai.request.model": settings.model,
                 "orbit.manager.template": (
                     self.build(run.build_id).get("manager_template_id") if run.build_id else ""
                 ),
                 "orbit.iteration": iteration,
+                "orbit.candidate.id": candidate_id or "",
+                "orbit.evidence.step_count": len(cycle_evidence),
+                **_telemetry_text_metadata("gen_ai.request.prompt", supervisor_prompt),
             },
         ) as span:
             try:
-                result = self._validated_supervisor_result(provider.complete(settings, supervisor_prompt))
+                span.add_event("gen_ai.request.sent")
+                response_text = provider.complete(settings, supervisor_prompt)
+                span.set_attributes(_telemetry_text_metadata("gen_ai.response", response_text))
+                span.add_event("gen_ai.response.received")
+                result = self._validated_supervisor_result(response_text)
                 evaluation = result.get("evaluation")
                 if evaluation is not None:
                     threshold = (
@@ -4639,7 +4989,9 @@ if __name__ == "__main__":
                 for improvement in result["improvements"]:
                     improvement.setdefault("reported_at", reported_at)
                     improvement.setdefault("effect_score", (result.get("evaluation") or {}).get("score"))
-                    improvement.setdefault("attempted", improvement.get("status") in {"adopted", "rejected"})
+                    improvement.setdefault(
+                        "attempted", improvement.get("status") in {"adopted", "accepted", "rejected"}
+                    )
                 for issue in result["reported_issues"]:
                     issue.setdefault("reported_at", reported_at)
                 run = self._load(run_id)
@@ -4663,7 +5015,16 @@ if __name__ == "__main__":
                 self._review_cycle_improvement(run, iteration, result, settings, provider)
                 span.set_attribute("orbit.supervisor.improvements", len(result["improvements"]))
                 span.set_attribute("orbit.supervisor.reported_issues", len(result["reported_issues"]))
-                span.add_event("supervisor.response.validated")
+                if isinstance(evaluation, dict):
+                    span.set_attribute("orbit.supervisor.score", evaluation.get("score", 0))
+                    span.set_attribute("orbit.supervisor.approval", str(evaluation.get("approval", "")))
+                span.add_event(
+                    "supervisor.response.validated",
+                    {
+                        "orbit.supervisor.improvements": len(result["improvements"]),
+                        "orbit.supervisor.reported_issues": len(result["reported_issues"]),
+                    },
+                )
             except ValueError as error:
                 run = self._load(run_id)
                 run.supervisor_status, run.supervisor_error, run.updated_at = (
@@ -4682,7 +5043,8 @@ if __name__ == "__main__":
                 )
                 self._save(run)
                 span.record_exception(error)
-                span.add_event("supervisor.response.invalid", {"reason": str(error)})
+                span.set_status(Status(StatusCode.ERROR))
+                span.add_event("supervisor.response.invalid", {"error.type": type(error).__name__})
             except (RuntimeError, requests.RequestException) as error:
                 run = self._load(run_id)
                 run.supervisor_status, run.supervisor_error, run.updated_at = "failed", str(error), now()
@@ -4697,7 +5059,8 @@ if __name__ == "__main__":
                 )
                 self._save(run)
                 span.record_exception(error)
-                span.add_event("supervisor.request.failed", {"reason": str(error)})
+                span.set_status(Status(StatusCode.ERROR))
+                span.add_event("supervisor.request.failed", {"error.type": type(error).__name__})
 
     def _review_cycle_improvement(
         self, run: Run, iteration: int, result: dict[str, Any], settings: ModelSettings, provider: Any
@@ -4715,10 +5078,29 @@ if __name__ == "__main__":
             )
         )
         try:
-            reviewed = json.loads(provider.complete(settings, prompt))
-            interventions = reviewed.get("interventions", []) if isinstance(reviewed, dict) else []
-            if not isinstance(interventions, list):
-                return
+            with self.tracer.start_as_current_span(
+                "supervisor.cycle_review",
+                attributes={
+                    "run.id": run.id,
+                    "gen_ai.operation.name": "chat",
+                    "gen_ai.provider.name": settings.provider,
+                    "gen_ai.request.model": settings.model,
+                    "orbit.iteration": iteration,
+                    **_telemetry_text_metadata("gen_ai.request.prompt", prompt),
+                },
+            ) as span:
+                span.add_event("gen_ai.request.sent")
+                response_text = provider.complete(settings, prompt)
+                span.set_attributes(_telemetry_text_metadata("gen_ai.response", response_text))
+                span.add_event("gen_ai.response.received")
+                reviewed = json.loads(response_text)
+                interventions = reviewed.get("interventions", []) if isinstance(reviewed, dict) else []
+                if not isinstance(interventions, list):
+                    span.set_status(Status(StatusCode.ERROR))
+                    span.add_event("supervisor.cycle_review.invalid_response")
+                    return
+                span.set_attribute("orbit.cycle_review.intervention_count", len(interventions))
+                span.add_event("supervisor.cycle_review.validated")
             stored = self.cycle_interventions()
             for intervention in interventions:
                 if not isinstance(intervention, dict) or not isinstance(intervention.get("title"), str):
@@ -4757,6 +5139,11 @@ if __name__ == "__main__":
                 "run.id": run_id,
                 "step.id": step.id,
                 "step.phase": step.phase,
+                "orbit.iteration": loop_index,
+                "orbit.candidate.id": candidate_id or "",
+                "process.command.executable": Path(step.command[0]).name if step.command else "",
+                "process.command.argument_count": max(0, len(step.command) - 1),
+                "process.timeout.seconds": step.timeout_seconds,
             },
         ) as span:
             run = self._load(run_id)
@@ -4801,6 +5188,7 @@ if __name__ == "__main__":
                 if base_candidate_id:
                     environment["ORBIT_BASE_CANDIDATE_ID"] = base_candidate_id
                 environment["ORBIT_RUN_ID"] = run_id
+                environment["ORBIT_RUNNER_ID"] = run.workflow_id
                 environment["ORBIT_RUNNER_RESOURCES"] = base64.b64encode(
                     json.dumps(resources or {}, ensure_ascii=False).encode("utf-8")
                 ).decode("ascii")
@@ -4818,6 +5206,7 @@ if __name__ == "__main__":
                     creationflags=creation_flags,
                     env=environment,
                 )
+                span.add_event("process.started", {"process.pid": process.pid})
                 interruption_timer: threading.Timer | None = None
                 if (
                     step.phase == "verify"
@@ -5050,7 +5439,13 @@ if __name__ == "__main__":
                 run.pid, run.updated_at = None, now()
                 self._save(run)
                 span.add_event("process.completed", {"process.exit_code": process.returncode})
+                span.set_attribute("process.exit_code", process.returncode)
+                span.set_attribute("process.output.line_count", len(captured_lines))
+                span.set_attribute("orbit.result.has_structured_output", structured_result is not None)
+                span.set_attribute("orbit.result.target_log_count", len(target_logs))
+                span.set_attribute("orbit.result.data_file_count", len(data_files))
                 if process.returncode and step.on_failure == "stop":
+                    span.set_status(Status(StatusCode.ERROR))
                     if step.phase == "verify" and run.advance_requested:
                         run.advance_requested = False
                         self._save(run)
@@ -5065,12 +5460,14 @@ if __name__ == "__main__":
             except subprocess.TimeoutExpired:
                 self._stop_process_group(process, force=True)
                 span.add_event("process.timeout", {"timeout.seconds": step.timeout_seconds})
+                span.set_status(Status(StatusCode.ERROR))
                 if self._load(run_id).status == "cancelled":
                     return
                 self._fail(self._load(run_id), step.id, f"timed out after {step.timeout_seconds}s")
                 return
             except ValueError as error:
-                span.add_event("step.rejected", {"reason": str(error)})
+                span.add_event("step.rejected", {"error.type": type(error).__name__})
+                span.set_status(Status(StatusCode.ERROR))
                 self._fail(self._load(run_id), step.id, str(error))
                 return
             finally:
@@ -5167,14 +5564,19 @@ if __name__ == "__main__":
                 stopped.append(self.cancel(run.id))
         return stopped
 
-    def invoke_remote_build(self, build_id: str, execution_mode: str = "run") -> Run:
+    def invoke_remote_build(
+        self, build_id: str, execution_mode: str = "run", output_locale: str | None = None
+    ) -> Run:
         build = self.build(build_id)
         executor = build.get("executor", {})
         if not build.get("enabled"):
             raise ValueError("This build is not enabled.")
         if execution_mode not in {"run", "test"}:
             raise ValueError("execution_mode must be run or test")
-        prompt_source, prompt_snapshot = self._assembled_prompt(build)
+        resolved_output_locale = (
+            str(output_locale or self.application_settings()["manager_output_locale"]).strip() or "en"
+        )
+        prompt_source, prompt_snapshot = self._assembled_prompt(build, resolved_output_locale)
         if executor.get("type") != "remote-http":
             return self.create_run(
                 build["runner_id"],
@@ -5183,6 +5585,7 @@ if __name__ == "__main__":
                 build_id=build["id"],
                 build_name=build["name"],
                 supervisor_profile_name=build.get("model_profile_name"),
+                output_locale=resolved_output_locale,
                 prompt_source=prompt_source,
                 prompt_snapshot=prompt_snapshot,
                 loop_limit=1 if execution_mode == "test" else int(build.get("run_limit", 1)),
@@ -5224,6 +5627,7 @@ if __name__ == "__main__":
             build_id=build["id"],
             build_name=build["name"],
             supervisor_profile_name=build.get("model_profile_name"),
+            output_locale=resolved_output_locale,
             execution_mode=execution_mode,
             execution_type="invoke",
             status="queued",
@@ -5240,15 +5644,24 @@ if __name__ == "__main__":
         threading.Thread(target=self._execute_remote, args=(run.id, executor), daemon=True).start()
         return run
 
-    def test_build(self, build_id: str) -> Run:
+    def test_build(self, build_id: str, output_locale: str | None = None) -> Run:
         build = self.build(build_id)
         if not build.get("enabled"):
             raise ValueError("This build is not enabled.")
-        return self.invoke_remote_build(build_id, "test")
+        return self.invoke_remote_build(build_id, "test", output_locale=output_locale)
 
     def _execute_remote(self, run_id: str, executor: dict[str, Any]) -> None:
         run = self._load(run_id)
-        with self.tracer.start_as_current_span("remote.agent.run", attributes={"run.id": run_id}) as span:
+        endpoint = str(executor.get("endpoint", ""))
+        with self.tracer.start_as_current_span(
+            "remote.agent.run",
+            attributes={
+                "run.id": run_id,
+                "http.request.method": str(executor.get("method", "POST")),
+                "server.address": urlparse(endpoint).hostname or "",
+                "http.request.timeout_seconds": int(executor.get("timeout_seconds", 0) or 0),
+            },
+        ) as span:
             run.status, run.current_phase, run.telemetry_trace_id, run.updated_at = (
                 "running",
                 "execute",
@@ -5269,6 +5682,10 @@ if __name__ == "__main__":
                 invocation = RemoteInvocation(**invocation_values)
                 status_code, output = invocation.invoke()
                 span.set_attribute("http.response.status_code", status_code)
+                span.set_attributes(_telemetry_text_metadata("http.response.body", output))
+                span.add_event("remote.response.received", {"http.response.status_code": status_code})
+                if not 200 <= status_code < 300:
+                    span.set_status(Status(StatusCode.ERROR))
                 run = self._load(run_id)
                 run.step_results.append(
                     {"step_id": "execute", "phase": "execute", "http_status": status_code, "output": output}
@@ -5280,4 +5697,6 @@ if __name__ == "__main__":
                     self._complete_supervision(run_id)
             except (ValueError, requests.RequestException) as error:
                 span.record_exception(error)
+                span.set_status(Status(StatusCode.ERROR))
+                span.add_event("remote.request.failed", {"error.type": type(error).__name__})
                 self._fail(self._load(run_id), "execute", str(error))

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { lazy, Suspense, useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { AppShell } from "./app/app-shell";
 import { ConfirmDialog } from "./components/ui/confirm-dialog";
@@ -6,11 +6,38 @@ import { ToastProvider } from "./components/ui/toast";
 import { SectionSkeleton } from "./components/ui/section-skeleton";
 import type { Page, Run } from "./domain/models";
 import { DashboardPage } from "./features/dashboard/page";
-import { AssetsPage } from "./features/assets/page";
-import { BuildsPage } from "./features/builds/page";
-import { EvaluationsPage } from "./features/evaluations/page";
-import { ImprovementsPage } from "./features/improvements/page";
-import { SettingsPage } from "./features/settings/page";
+
+const AssetsPage = lazy(() =>
+  import("./features/assets/page").then((module) => ({
+    default: module.AssetsPage,
+  })),
+);
+
+const BuildsPage = lazy(() =>
+  import("./features/builds/page").then((module) => ({
+    default: module.BuildsPage,
+  })),
+);
+
+const EvaluationsPage = lazy(() =>
+  import("./features/evaluations/page").then((module) => ({
+    default: module.EvaluationsPage,
+  })),
+);
+
+const ImprovementsPage = lazy(() =>
+  import("./features/improvements/page").then((module) => ({
+    default: module.ImprovementsPage,
+  })),
+);
+const IssuesPage = lazy(() => import("./features/issues/page").then((module) => ({ default: module.IssuesPage })));
+
+const SettingsPage = lazy(() =>
+  import("./features/settings/page").then((module) => ({
+    default: module.SettingsPage,
+  })),
+);
+
 import { localeMessages, locales, resolveLocale, type Locale } from "./locales";
 import { api } from "./services/api";
 import { useControlRoom } from "./services/use-control-room";
@@ -30,6 +57,7 @@ const pages: Page[] = [
   "builds",
   "runs",
   "improvements",
+  "issues",
   "settings",
 ];
 const pageFromHash = (): Page => {
@@ -82,7 +110,7 @@ export default function App() {
     api<{ response: string }>("/api/settings/hello", "POST", room.settings)
       .then((r) => {
         room.setSettingsTested(true);
-        room.setNotice(`Test succeeded: ${r.response}`, "success");
+        room.setNotice(ui.settingsTestSucceeded(r.response), "success");
       })
       .catch((e) => room.setNotice(e.message));
   const stop = () =>
@@ -106,7 +134,7 @@ export default function App() {
   const retryRun = (id: string, restartFromFirst: boolean) =>
     api(`/api/runs/${id}/retry`, "POST", { restart_from_first: restartFromFirst })
       .then(() => {
-        room.setNotice("Evaluation retry started.", "warning");
+        room.setNotice(ui.evaluationRetryStarted, "warning");
         room.refresh();
       })
       .catch((e) => room.setNotice(e.message));
@@ -116,7 +144,7 @@ export default function App() {
     )
       .then(() => {
         room.setNotice(
-          `${ids.length} run${ids.length === 1 ? "" : "s"} deleted`,
+          ui.runsDeleted(ids.length),
           "success",
         );
         return room.refresh();
@@ -147,14 +175,14 @@ export default function App() {
     });
   };
   const invoke = (id: string) =>
-    api(`/api/builds/${id}/runs`, "POST")
+    api(`/api/builds/${id}/runs`, "POST", { output_locale: locale })
       .then(() => {
         room.setNotice(ui.evaluationStarted, "success");
         room.refresh();
       })
       .catch((e) => room.setNotice(e.message));
   const testBuild = (id: string) =>
-    api<Run>(`/api/builds/${id}/tests`, "POST")
+    api<Run>(`/api/builds/${id}/tests`, "POST", { output_locale: locale })
       .then((run) => {
         room.setNotice(ui.evaluationTestStarted, "success");
         return run;
@@ -189,6 +217,13 @@ export default function App() {
         room.refresh();
       })
       .catch((e) => room.setNotice(e.message));
+  const toggleBuildStar = (id: string, starred: boolean) =>
+    api(`/api/builds/${id}/star`, "PATCH", { starred })
+      .then(() => room.refresh())
+      .catch((e) => {
+        room.setNotice(e.message);
+        throw e;
+      });
   const deleteAsset = (
     kind:
       | "profile"
@@ -279,6 +314,7 @@ export default function App() {
         onTest={testBuild}
         onCreate={createBuild}
         onUpdate={updateBuild}
+        onToggleStar={toggleBuildStar}
         onDelete={deleteBuild}
         onQuickStartCreate={createQuickStart}
         quickStartRequest={quickStartRequest}
@@ -301,7 +337,14 @@ export default function App() {
         onDeleteRuns={deleteRuns}
       />
     ),
-    improvements: <ImprovementsPage />,
+    improvements: <ImprovementsPage
+      runs={room.runs}
+      onStop={stopRun}
+      onRetry={retryRun}
+      onApprove={approveRun}
+      onReject={rejectRun}
+    />,
+    issues: <IssuesPage locale={locale} onNotice={(message, tone) => room.setNotice(message, tone)} />,
     settings: (
       room.loading ? <>
         <SectionSkeleton rows={2} />
@@ -344,7 +387,9 @@ export default function App() {
         ).length
       }
     >
-      <div className="page-stack">{content}</div>
+     <Suspense fallback={<SectionSkeleton rows={6} />}>
+  <div className="page-stack">{content}</div>
+</Suspense>
       <ConfirmDialog
         open={deletingBuild !== null}
         title={confirmation.title}
