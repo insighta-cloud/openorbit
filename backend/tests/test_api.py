@@ -1,8 +1,11 @@
 import base64
+import io
 import json
 import sys
 import threading
 import time
+import zipfile
+from pathlib import Path
 from types import SimpleNamespace
 
 import orbit_sdk as sdk
@@ -132,7 +135,7 @@ def test_runner_exec_can_forward_child_output_to_target_logs(tmp_path, monkeypat
         "from orbit_sdk import runner\n"
         "@runner.phase('execute')\n"
         "def run(ctx):\n"
-        "    ctx.exec([sys.executable, '-c', \"print('adapter ready')\"], target_log_source='test-adapter')\n"
+        "    ctx.exec([sys.executable, '-c', \"import sys; print(sys.stdin.read()); print('adapter ready'); print('__ORBIT_ADAPTER_RESULT__{\\\"ok\\\": true}')\"], input='adapter input', target_log_source='test-adapter', target_log_exclude_prefixes=('__ORBIT_ADAPTER_RESULT__',))\n"
         "if __name__ == '__main__': runner.main()\n",
         encoding="utf-8",
     )
@@ -165,8 +168,11 @@ def test_runner_exec_can_forward_child_output_to_target_logs(tmp_path, monkeypat
     step = store._load("forwarded-target-log-run").step_results[-1]
     assert "adapter ready" in step["output"]
     assert [(entry["source"], entry["message"]) for entry in step["target_logs"]] == [
+        ("test-adapter", "adapter input"),
         ("test-adapter", "adapter ready"),
     ]
+    assert "__ORBIT_ADAPTER_RESULT__" in step["output"]
+    assert "adapter input" in step["output"]
 
 
 def test_running_workflow_function_is_retained_before_its_step_finishes(tmp_path, monkeypatch):
@@ -497,7 +503,11 @@ def test_finalize_runs_after_a_terminal_iteration_for_repository_recovery(
 
 
 def test_native_improvement_template_uses_repository_snapshot_lifecycle():
-    source = store_module.NATIVE_IMPROVEMENT_CYCLE_TEMPLATE
+    source = next(
+        item["source"]
+        for item in store_module.ConsoleStore.runner_templates()
+        if item["id"] == "native-improvement-cycle"
+    )
 
     assert "ctx.save_before_each_snapshot()" in source
     assert "ctx.save_first_after_each_snapshot()" in source
@@ -983,6 +993,66 @@ def test_template_translation_cache_only_accepts_display_text_shape(tmp_path, mo
         )
 
 
+def test_cached_template_translation_endpoint_returns_only_existing_cache(tmp_path, monkeypatch):
+    monkeypatch.setattr(store_module, "TEMPLATE_TRANSLATIONS", tmp_path / "template-translations.json")
+    quick_start_id = "openorbit.user-journey-smoke-test"
+    source = main_module.store.template_translation_input("quick-start", quick_start_id)
+    main_module.store.save_template_translation("quick-start", quick_start_id, "ko", source, source)
+
+    cached = TestClient(app).post(
+        "/api/template-translations/cached",
+        json={"kind": "quick-start", "template_id": quick_start_id, "locale": "ko"},
+    )
+    missing = TestClient(app).post(
+        "/api/template-translations/cached",
+        json={"kind": "quick-start", "template_id": quick_start_id, "locale": "ja"},
+    )
+
+    assert cached.status_code == 200
+    assert cached.json() == {"content": source}
+    assert missing.status_code == 200
+    assert missing.json() == {"content": None}
+
+
+def test_quick_start_translation_includes_placeholders_and_tooltips(monkeypatch):
+    store = store_module.ConsoleStore()
+    manifest = {
+        "id": "example.translated-quick-start",
+        "name": "Translated quick start",
+        "description": "Checks translated form help.",
+        "parameters": [
+            {
+                "key": "repository",
+                "label": "Repository",
+                "placeholder": "/absolute/path/to/repository",
+                "tooltip": "The workspace that OpenOrbit inspects.",
+            }
+        ],
+    }
+    monkeypatch.setattr(store, "quick_starts", lambda: [manifest])
+
+    source = store.template_translation_input("quick-start", manifest["id"])
+    translated = store.validate_template_translation(
+        source,
+        {
+            "name": "번역된 퀵스타트",
+            "description": "번역된 폼 도움말을 확인합니다.",
+            "parameters": [
+                {
+                    "label": "저장소",
+                    "placeholder": "/절대/경로/저장소",
+                    "tooltip": "OpenOrbit이 검사할 작업공간입니다.",
+                }
+            ],
+        },
+    )
+
+    assert source["parameters"][0]["placeholder"] == "/absolute/path/to/repository"
+    assert source["parameters"][0]["tooltip"] == "The workspace that OpenOrbit inspects."
+    assert translated["parameters"][0]["placeholder"] == "/절대/경로/저장소"
+    assert translated["parameters"][0]["tooltip"] == "OpenOrbit이 검사할 작업공간입니다."
+
+
 def test_v1_project_list_uses_gitlab_style_pagination_headers():
     response = TestClient(app).get("/api/v1/projects?page=1&per_page=1")
     assert response.status_code == 200
@@ -1150,6 +1220,7 @@ def test_supervision_includes_setup_managed_prompt_evidence(tmp_path, monkeypatc
                 "region": "us-east-1",
                 "secret_env": "AZURE_OPENAI_API_KEY",
                 "aws_profile": "",
+                "created_at": "2026-01-01T00:00:00+00:00",
             }
         ],
     )
@@ -1258,6 +1329,52 @@ def test_site_exploration_quick_start_uses_the_langgraph_runner():
     assert "logout|signout|delete" in runner["source"]
 
 
+def test_quick_start_workflow_graph_can_be_previewed_before_creation(monkeypatch):
+    store = store_module.ConsoleStore()
+    captured = {}
+    expected = {"nodes": [{"id": "start"}], "edges": []}
+
+    def preview(source):
+        captured["source"] = source
+        return expected
+
+    monkeypatch.setattr(store, "preview_runner_graph", preview)
+
+    assert store.preview_quick_start_graph("openorbit.agent-self-improvement") == expected
+    assert "@runner.phase" in captured["source"]
+
+
+def test_saved_runner_graph_preview_uses_the_selected_version(monkeypatch):
+    store = store_module.ConsoleStore()
+    expected = {"nodes": [{"id": "start"}], "edges": []}
+    captured = {}
+
+    def preview(runner_id, repository, runner_version=None):
+        captured.update(runner_id=runner_id, repository=repository, runner_version=runner_version)
+        return expected
+
+    monkeypatch.setattr(store, "_runner_graph_definition", preview)
+
+    assert store.runner_graph_preview("runner-id", 5) == expected
+    assert captured == {"runner_id": "runner-id", "repository": None, "runner_version": 5}
+
+
+def test_runner_graph_draft_is_previewed_by_id(monkeypatch):
+    store = store_module.ConsoleStore()
+    captured = {}
+    expected = {"nodes": [{"id": "draft"}], "edges": []}
+
+    def preview(source):
+        captured["source"] = source
+        return expected
+
+    monkeypatch.setattr(store, "preview_runner_graph", preview)
+    draft = store.create_runner_graph_draft("from orbit_sdk import runner\n")
+
+    assert store.preview_runner_graph_draft(draft["id"]) == expected
+    assert captured["source"] == "from orbit_sdk import runner\n"
+
+
 @pytest.mark.parametrize(
     ("quick_start_id", "phases"),
     [
@@ -1356,7 +1473,7 @@ def test_ai_slo_drift_quick_start_persists_its_evaluator_command(tmp_path, monke
         {
             "repository": str(tmp_path),
             "probe_command": "uv run ai-eval",
-            "model": "gpt-4o",
+            "model_profile_name": "Default",
         },
     )
 
@@ -1364,6 +1481,110 @@ def test_ai_slo_drift_quick_start_persists_its_evaluator_command(tmp_path, monke
     assert execution["environment_variables"] == {"ORBIT_PROBE_COMMAND": "uv run ai-eval"}
     assert created["build"]["repeat_interval_minutes"] == 1440
     assert store.profiles()[-1]["endpoint"] == ""
+
+
+def test_browser_quick_starts_create_an_internal_workspace_without_a_repository(tmp_path, monkeypatch):
+    monkeypatch.setattr(store_module, "APP_DATA", tmp_path / "app-data")
+    monkeypatch.setattr(store_module, "CONFIG", tmp_path / "config")
+    monkeypatch.setattr(store_module, "SETTINGS", tmp_path / "settings.json")
+    monkeypatch.setattr(store_module, "RUNNERS", tmp_path / "runners")
+    monkeypatch.setattr(store_module, "RUNNER_TEMPLATES", tmp_path / "runner-templates")
+    monkeypatch.setattr(store_module, "QUICK_STARTS", tmp_path / "quick-starts")
+    monkeypatch.setattr(store_module, "QUICK_START_INSTANCES", tmp_path / "quick-start-instances.yaml")
+    monkeypatch.setattr(store_module, "EXECUTION_ENVIRONMENTS", tmp_path / "execution-environments.yaml")
+    monkeypatch.setattr(store_module, "TARGET_ENVIRONMENTS", tmp_path / "target-environments.yaml")
+    monkeypatch.setattr(store_module, "TARGET_TEST_CASE_SETS", tmp_path / "target-test-case-sets.yaml")
+    store = store_module.ConsoleStore()
+
+    created = store.instantiate_quick_start(
+        "openorbit.user-journey-smoke-test",
+        {
+            "base_url": "http://localhost:3000",
+            "journey_prompt": "Open the home page.",
+            "acceptance": "The page loads.",
+            "model_profile_name": "Default",
+        },
+    )
+
+    quick_starts = {item["id"]: item for item in store._built_in_quick_starts()}
+    target = store._target_environment(created["generated"]["target_environment_id"])
+    for quick_start_id in {
+        "openorbit.continuous-user-journey",
+        "openorbit.critical-flow-proof",
+        "openorbit.site-exploration-review",
+        "openorbit.user-journey-smoke-test",
+    }:
+        assert "repository" not in {
+            parameter["key"] for parameter in quick_starts[quick_start_id]["parameters"]
+        }
+    assert "base_url" not in {
+        parameter["key"] for parameter in quick_starts["openorbit.agent-self-improvement"]["parameters"]
+    }
+    assert target["repository"] == str(
+        tmp_path / "app-data" / "quick-start-workspaces" / created["build"]["id"]
+    )
+    assert Path(target["repository"]).is_dir()
+
+
+def test_quick_start_required_errors_include_the_display_label():
+    store = store_module.ConsoleStore()
+
+    with pytest.raises(ValueError, match=r"User actions \(journey_prompt\) is required"):
+        store.instantiate_quick_start(
+            "openorbit.user-journey-smoke-test", {"base_url": "http://localhost:3000"}
+        )
+
+
+def test_quick_start_can_create_and_assign_a_model_profile(tmp_path, monkeypatch):
+    monkeypatch.setattr(store_module, "CONFIG", tmp_path)
+    monkeypatch.setattr(store_module, "SETTINGS", tmp_path / "settings.json")
+    monkeypatch.setattr(store_module, "RUNNERS", tmp_path / "runners")
+    monkeypatch.setattr(store_module, "QUICK_STARTS", tmp_path / "quick-starts")
+    monkeypatch.setattr(store_module, "QUICK_START_INSTANCES", tmp_path / "quick-start-instances.yaml")
+    monkeypatch.setattr(store_module, "EXECUTION_ENVIRONMENTS", tmp_path / "execution-environments.yaml")
+    monkeypatch.setattr(store_module, "TARGET_ENVIRONMENTS", tmp_path / "target-environments.yaml")
+    monkeypatch.setattr(store_module, "TARGET_TEST_CASE_SETS", tmp_path / "target-test-case-sets.yaml")
+    store = store_module.ConsoleStore()
+
+    created = store.instantiate_quick_start(
+        "openorbit.user-journey-smoke-test",
+        {
+            "base_url": "http://localhost:3000",
+            "journey_prompt": "Open the home page.",
+            "acceptance": "The page loads.",
+            "model_profile_name": "Quick Start model",
+            "__model_profile_mode": "create",
+            "__model_profile_provider": "azure-openai",
+            "__model_profile_model": "gpt-4o",
+            "__model_profile_endpoint": "https://example.openai.azure.com",
+            "__model_profile_secret_env": "AZURE_OPENAI_API_KEY",
+        },
+    )
+
+    assert created["build"]["model_profile_name"] == "Quick Start model"
+    assert any(profile["profile_name"] == "Quick Start model" for profile in store.profiles())
+
+
+def test_builtin_quick_starts_only_declare_a_model_profile_selector():
+    store = store_module.ConsoleStore()
+    legacy_keys = {"profile_name", "provider", "model", "endpoint", "region", "secret_env"}
+
+    for quick_start in store._built_in_quick_starts():
+        parameters = quick_start["parameters"]
+        profile_parameters = [
+            parameter for parameter in parameters if parameter["key"] == "model_profile_name"
+        ]
+        assert profile_parameters == [
+            {
+                "key": "model_profile_name",
+                "label": "AI model profile",
+                "type": "model_profile",
+                "required": True,
+                "tooltip": "Select an existing AI model profile, or create one for this build.",
+            }
+        ]
+        assert not legacy_keys & {parameter["key"] for parameter in parameters}
+        assert "model_profile" not in quick_start["assets"]
 
 
 def test_runner_templates_can_be_imported_into_app_data(tmp_path, monkeypatch):
@@ -1380,7 +1601,137 @@ def test_runner_templates_can_be_imported_into_app_data(tmp_path, monkeypatch):
     templates = {item["id"]: item for item in store.available_runner_templates()}
     assert imported["origin"] == "user"
     assert templates["shared-browser-check"]["source"] == imported["source"]
-    assert (tmp_path / "runner-templates" / "shared-browser-check.json").exists()
+    package = tmp_path / "runner-templates" / "shared-browser-check"
+    assert (package / "template.json").exists()
+    assert (package / "runner.py").exists()
+
+
+def test_folder_template_packages_keep_documentation_and_external_runner_source(tmp_path, monkeypatch):
+    monkeypatch.setattr(store_module, "RUNNER_TEMPLATES", tmp_path / "runner-templates")
+    monkeypatch.setattr(store_module, "QUICK_STARTS", tmp_path / "quick-starts")
+    runner_package = store_module.RUNNER_TEMPLATES / "documented-runner"
+    runner_package.mkdir(parents=True)
+    (runner_package / "template.json").write_text(
+        json.dumps({"id": "documented-runner", "name": "Documented", "description": "Folder package."}),
+        encoding="utf-8",
+    )
+    (runner_package / "runner.py").write_text("from orbit_sdk import runner\n", encoding="utf-8")
+    (runner_package / "README.md").write_text("# Runner docs\n", encoding="utf-8")
+    (runner_package / "LICENSE").write_text("MIT\n", encoding="utf-8")
+    store = store_module.ConsoleStore()
+
+    template = next(item for item in store.available_runner_templates() if item["id"] == "documented-runner")
+
+    assert template["readme"] == "# Runner docs\n"
+    assert template["license"] == "MIT\n"
+    assert template["package_path"] == str(runner_package)
+
+
+def _template_zip(files: dict[str, str]) -> bytes:
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w") as bundle:
+        for name, content in files.items():
+            bundle.writestr(name, content)
+    return archive.getvalue()
+
+
+def test_runner_template_zip_import_preserves_the_complete_package(tmp_path, monkeypatch):
+    monkeypatch.setattr(store_module, "RUNNER_TEMPLATES", tmp_path / "runner-templates")
+    store = store_module.ConsoleStore()
+    imported = store.import_runner_template_package_zip(
+        _template_zip(
+            {
+                "portable-runner/template.json": json.dumps(
+                    {"id": "portable-runner", "name": "Portable", "description": "ZIP package."}
+                ),
+                "portable-runner/runner.py": "from orbit_sdk import runner\n",
+                "portable-runner/README.md": "# Portable runner\n",
+                "portable-runner/LICENSE": "OpenOrbit License\n",
+                "portable-runner/support/example.txt": "kept\n",
+            }
+        ),
+        "portable-runner.zip",
+    )
+
+    package = store_module.RUNNER_TEMPLATES / "portable-runner"
+    assert imported["id"] == "portable-runner"
+    assert (package / "README.md").read_text(encoding="utf-8") == "# Portable runner\n"
+    assert (package / "support" / "example.txt").read_text(encoding="utf-8") == "kept\n"
+    assert next(item for item in store.available_runner_templates() if item["id"] == "portable-runner")[
+        "readme"
+    ]
+
+
+def test_quick_start_zip_import_preserves_the_complete_package(tmp_path, monkeypatch):
+    monkeypatch.setattr(store_module, "QUICK_STARTS", tmp_path / "quick-starts")
+    source = store_module.ROOT / "templates" / "quick-starts" / "openorbit.ai-experience-improvement"
+    manifest = json.loads((source / "manifest.json").read_text(encoding="utf-8"))
+    manifest["id"] = "example.portable-ai-journey"
+    archive = _template_zip(
+        {
+            "portable-quick-start/manifest.json": json.dumps(manifest),
+            "portable-quick-start/runner.py": (source / "runner.py").read_text(encoding="utf-8"),
+            "portable-quick-start/README.md": "# Portable quick start\n",
+            "portable-quick-start/LICENSE": "OpenOrbit License\n",
+            "portable-quick-start/assets/notes.txt": "kept\n",
+        }
+    )
+    store = store_module.ConsoleStore()
+
+    imported = store.import_quick_start_package_zip(archive, "portable-quick-start.zip")
+
+    package = store_module.QUICK_STARTS / "example.portable-ai-journey"
+    assert imported["id"] == "example.portable-ai-journey"
+    assert (package / "LICENSE").read_text(encoding="utf-8") == "OpenOrbit License\n"
+    assert (package / "assets" / "notes.txt").read_text(encoding="utf-8") == "kept\n"
+    assert any(item["id"] == "example.portable-ai-journey" for item in store.quick_starts())
+
+
+def test_template_zip_import_rejects_path_traversal(tmp_path, monkeypatch):
+    monkeypatch.setattr(store_module, "RUNNER_TEMPLATES", tmp_path / "runner-templates")
+    store = store_module.ConsoleStore()
+
+    with pytest.raises(ValueError, match="unsafe file path"):
+        store.import_runner_template_package_zip(
+            _template_zip(
+                {
+                    "bad/template.json": json.dumps(
+                        {"id": "bad-template", "name": "Bad", "description": "Bad ZIP."}
+                    ),
+                    "bad/runner.py": "pass\n",
+                    "../outside.txt": "nope\n",
+                }
+            ),
+            "bad.zip",
+        )
+
+    assert not (tmp_path / "outside.txt").exists()
+    assert not (store_module.RUNNER_TEMPLATES / "bad-template").exists()
+
+
+def test_runner_template_package_upload_api_accepts_zip(tmp_path, monkeypatch):
+    monkeypatch.setattr(store_module, "RUNNER_TEMPLATES", tmp_path / "runner-templates")
+    monkeypatch.setattr(main_module, "store", store_module.ConsoleStore())
+    response = TestClient(app).post(
+        "/api/runner-templates/import-package",
+        files={
+            "file": (
+                "api-runner.zip",
+                _template_zip(
+                    {
+                        "api-runner/template.json": json.dumps(
+                            {"id": "api-runner", "name": "API runner", "description": "Uploaded package."}
+                        ),
+                        "api-runner/runner.py": "from orbit_sdk import runner\n",
+                    }
+                ),
+                "application/zip",
+            )
+        },
+    )
+
+    assert response.status_code == 201
+    assert response.json()["id"] == "api-runner"
 
 
 def test_build_star_is_persisted_without_changing_other_build_fields(tmp_path, monkeypatch):

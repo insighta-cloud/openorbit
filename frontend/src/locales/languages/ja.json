@@ -134,6 +134,26 @@
         "modelDeployment": {
           "label": "モデル / デプロイ",
           "hint": "呼び出すプロバイダー固有のモデルまたはデプロイ名です。"
+        },
+        "azureEndpoint": {
+          "label": "Azureエンドポイント",
+          "hint": "https://your-resource.openai.azure.com などの Azure OpenAI リソースエンドポイントです。"
+        },
+        "region": {
+          "label": "リージョン",
+          "hint": "eastus や us-east-1 など、このプロバイダーで使用するクラウドリージョンです。"
+        },
+        "awsProfile": {
+          "label": "AWS CLIプロファイル（任意）",
+          "hint": "Bedrock リクエストに使用する任意のローカル AWS CLI 認証プロファイルです。"
+        },
+        "secretEnv": {
+          "label": "シークレット環境変数",
+          "hint": "このプロバイダーの API キーまたは認証情報を保持する環境変数名です。"
+        },
+        "createNewAiProfile": {
+          "label": "新しいAIモデルプロファイルを作成…",
+          "hint": "このビルド用に新しい AI モデルプロファイルを作成して割り当てます。"
         }
       }
     },
@@ -233,6 +253,12 @@
       "deleteBuild": {
         "title": "ビルドを削除しますか？",
         "description": "ビルドとその設定が完全に削除されます。",
+        "cancel": "キャンセル",
+        "confirm": "削除"
+      },
+      "deleteAsset": {
+        "title": "アセットを削除しますか？",
+        "description": "アセットとその設定が完全に削除されます。",
         "cancel": "キャンセル",
         "confirm": "削除"
       },
@@ -380,6 +406,7 @@
       "buildListDescription": "対象、ワークフロー、再利用アセットをつなぐ反復タスクを管理します。",
       "createBuild": "ビルドを作成",
       "name": "名前",
+      "tasks": "タスク",
       "repository": "リポジトリ",
       "prompt": "プロンプト",
       "purpose": "目的",
@@ -496,6 +523,8 @@
       "createAssetsAndBuild": "アセットとビルドを作成",
       "creating": "作成中…",
       "quickStartReview": "ランナー、ポリシー、テストセット、実行環境、対象環境、ビルドを作成します。",
+      "quickStartWorkflowDescription": "実行時にランナーがワークフローをどのように進むかを事前に確認できます。",
+      "runnerWorkflowDescription": "選択したランナーが実行時にワークフローをどのように進むかを事前に確認できます。",
       "chatOpen": "チャットアシスタントを開く",
       "chatCollapse": "チャットを閉じる",
       "chatTitle": "Orbit アシスタント",
@@ -568,6 +597,7 @@
     "templateTranslation": {
       "translate": "翻訳",
       "translating": "翻訳中…",
+      "checkingCache": "保存済みの翻訳を確認中…",
       "showOriginal": "原文を表示",
       "failed": "テンプレートの翻訳に失敗しました。もう一度お試しください。"
     },
@@ -602,7 +632,7 @@
       "importFailed": "テンプレートをインポートできませんでした",
       "basedOn": "テンプレートに基づく",
       "changeTemplate": "テンプレートを変更",
-      "empty": "Empty",
+      "empty": "なし",
       "emptyDescription": "空の6フェーズランナーから始めます。",
       "id": "ID",
       "name": "名前",
@@ -726,6 +756,7 @@
     "evaluations": {
       "title": "実行履歴",
       "task": "タスク",
+      "orphanedBuild": "この実行のビルドはもう存在しません。",
       "evaluation": "結果",
       "iteration": "反復",
       "detail": "実行の詳細",
