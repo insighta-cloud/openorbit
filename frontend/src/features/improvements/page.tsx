@@ -1,5 +1,4 @@
-import { Check, Copy } from "lucide-react";
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
 import {
   Area,
   AreaChart,
@@ -21,9 +20,12 @@ import type {
   ImprovementIterationData,
   Build,
   ProposalLifecycle,
+  Run,
+  RunnerState,
   SavedDataFile,
 } from "../../domain/models";
 import { Modal } from "../../components/ui/modal";
+import { EvidenceViewer, visualEvidenceArtifacts } from "../../components/ui/evidence-viewer";
 import { PanelHeader } from "../../components/ui/page-header";
 import { SectionInfo } from "../../components/ui/section-info";
 import { StatusBadge } from "../../components/ui/status-badge";
@@ -36,14 +38,17 @@ import {
   resolveLocale,
   type Locale,
 } from "../../locales";
-import "./saved-data-files.css";
 import { FeedbackTrends } from "../dashboard/feedback-trends";
 import { SectionSkeleton } from "../../components/ui/section-skeleton";
+import { DataTable, type Column } from "../../components/ui/data-table";
+import { CircleStop, RotateCcw } from "lucide-react";
+import { EvaluationsPage } from "../evaluations/page";
 
 type ImprovementCopy = {
   improvement: string;
   trends: string;
   range: string;
+  unlimited: string;
   evaluation: string;
   feedbackVolume: string;
   iterationTrend: string;
@@ -57,6 +62,7 @@ type ImprovementCopy = {
   historyHint: string;
   allBuilds: string;
   allStates: string;
+  acceptable: string;
   rejected: string;
   proposed: string;
   decisionReason: string;
@@ -71,7 +77,6 @@ type ImprovementCopy = {
   feedbackCount: string;
   activeCount: string;
   noIterationFeedback: string;
-  adopted: string;
   low: string;
   medium: string;
   high: string;
@@ -81,6 +86,30 @@ type ImprovementCopy = {
   cancelled: string;
   running: string;
   selectBuild: string;
+  storedState: string;
+  storedStateHint: string;
+  noStoredState: string;
+  updated: string;
+  rawState: string;
+  buildState: string;
+  runnerState: string;
+  relatedRuns: string;
+  relatedRunsHint: string;
+  noRelatedRuns: string;
+  personaJourneys: string;
+  personaJourneysHint: string;
+  noPersonaJourneys: string;
+  personaGoal: string;
+  currentAction: string;
+  currentDecision: string;
+  nextAction: string;
+  started: string;
+  currentPhase: string;
+  stop: string;
+  retry: string;
+  retryWarning: string;
+  restart: string;
+  resume: string;
 };
 type ChartHints = {
   feedbackByBuild: string;
@@ -109,6 +138,182 @@ const compactTimestamp = (locale: Locale, value?: string) =>
     : "—";
 const lastRunTimestamp = (build: Build) =>
   build.last_run_at ? Date.parse(build.last_run_at) || 0 : 0;
+const terminalRun = (status: string) =>
+  ["succeeded", "failed", "cancelled"].includes(status);
+
+function RelatedRuns({
+  buildId, runs, locale, t, hours, onStop, onRetryRequest, onSelect,
+}: {
+  buildId: string;
+  runs: Run[];
+  locale: Locale;
+  t: (typeof copy)["en"];
+  hours: number;
+  onStop: (id: string) => void;
+  onRetryRequest: (run: Run) => void;
+  onSelect: (run: Run) => void;
+}) {
+  const [rangeStart] = useState(() => hours ? Date.now() - hours * 60 * 60 * 1000 : 0);
+  const related = useMemo(
+    () => runs.filter((run) =>
+      run.build_id === buildId && (rangeStart === 0 || !run.created_at || (Date.parse(run.created_at) || 0) >= rangeStart),
+    ).sort(
+      (left, right) => (Date.parse(right.created_at ?? "") || 0) - (Date.parse(left.created_at ?? "") || 0),
+    ),
+    [buildId, rangeStart, runs],
+  );
+  const active = related.filter((run) => !terminalRun(run.status));
+  const completed = related.filter((run) => terminalRun(run.status));
+  const visible = [...active, ...completed.slice(0, 5)];
+  const runUi = locales[locale].runUi;
+  const statusLabel = (status: string) => ({
+    succeeded: t.succeeded, failed: t.failed, cancelled: t.cancelled, running: t.running,
+    queued: runUi.queued,
+    awaiting_approval: runUi.awaitingApproval,
+  } as Record<string, string>)[status] ?? status;
+  const iteration = (run: Run) => {
+    const current = Math.max(0, ...(run.step_results ?? []).map((step) => step.loop_index ?? 0));
+    return run.loop_limit ? `${Math.min(current, run.loop_limit)}/${run.loop_limit}` : "—";
+  };
+  const columns: Column<Run>[] = [
+    { id: "run", header: t.run, render: (run) => <span className="related-run-id"><code>{run.id}</code><StatusBadge value={run.status} label={statusLabel(run.status)} /></span>, sortValue: (run) => run.id },
+    { id: "started", header: t.started, render: (run) => compactTimestamp(locale, run.created_at), sortValue: (run) => run.created_at },
+    { id: "iteration", header: t.iteration, render: iteration, sortValue: iteration },
+    { id: "phase", header: t.currentPhase, render: (run) => run.current_phase ?? "—", sortValue: (run) => run.current_phase },
+    { id: "actions", header: locales[locale].evaluation.action, render: (run) => {
+      const canRetry = terminalRun(run.status) && run.execution_type === "pipeline";
+      return <span className="build-actions">
+        {!terminalRun(run.status) && <button className="icon-button danger" title={t.stop} aria-label={t.stop} onClick={() => onStop(run.id)}><CircleStop size={16} /></button>}
+        {canRetry && <button className="icon-button" title={t.retry} aria-label={t.retry} onClick={() => onRetryRequest(run)}><RotateCcw size={16} /></button>}
+      </span>;
+    } },
+  ];
+  return (
+    <section className="panel related-runs" aria-labelledby="related-runs-title">
+      <div className="related-runs__heading">
+        <div>
+          <h2 id="related-runs-title">{t.relatedRuns}</h2>
+          <p>{t.relatedRunsHint}</p>
+        </div>
+        <div className="related-runs__counts">
+          <span>{t.running} <b>{active.length}</b></span>
+          <span>{t.succeeded} <b>{completed.filter((run) => run.status === "succeeded").length}</b></span>
+          <span>{t.failed} <b>{completed.filter((run) => run.status === "failed").length}</b></span>
+          <span>{t.cancelled} <b>{completed.filter((run) => run.status === "cancelled").length}</b></span>
+        </div>
+      </div>
+      <DataTable columns={columns} rows={visible} onRowClick={onSelect} className="related-runs-table" gridTemplateColumns="minmax(190px,1.4fr) minmax(118px,.85fr) 90px minmax(105px,1fr) minmax(145px,.9fr)" empty={t.noRelatedRuns} />
+    </section>
+  );
+}
+
+type PersonaJourneyEvent = {
+  id: string;
+  persona: string;
+  run: Run;
+  iteration: number;
+  recordedAt?: string;
+  goal?: string;
+  action?: string;
+  decision?: string;
+  nextAction?: string;
+};
+
+function PersonaJourneyTimeline({
+  buildId, runs, locale, t, hours, onSelect,
+}: {
+  buildId: string;
+  runs: Run[];
+  locale: Locale;
+  t: (typeof copy)["en"];
+  hours: number;
+  onSelect: (run: Run) => void;
+}) {
+  const [rangeStart] = useState(() => hours ? Date.now() - hours * 60 * 60 * 1000 : 0);
+  const drag = useRef<{ pointerId: number; startX: number; startScroll: number; moved: boolean } | null>(null);
+  const lanes = useMemo(() => {
+    const groups = new Map<string, PersonaJourneyEvent[]>();
+    for (const run of runs) {
+      if (run.build_id !== buildId) continue;
+      for (const record of run.supervisor_results ?? []) {
+        const trace = record.response?.evaluation?.behavior_trace;
+        if (!trace || !Object.values(trace).some(Boolean)) continue;
+        const recordedAt = record.recorded_at ?? run.updated_at ?? run.created_at;
+        if (rangeStart && recordedAt && (Date.parse(recordedAt) || 0) < rangeStart) continue;
+        const personas = new Set<string>();
+        for (const step of run.step_results ?? []) {
+          if (step.loop_index !== record.iteration || step.phase !== "before_each") continue;
+          const cycle = step.result?.insighta_persona_simulator ?? step.result?.persona_cycle;
+          if (!cycle || typeof cycle !== "object") continue;
+          const active = (cycle as { active_personas?: unknown }).active_personas;
+          if (Array.isArray(active)) active.forEach((persona) => {
+            if (typeof persona === "string" && persona) personas.add(persona);
+          });
+        }
+        const persona = [...personas].join(" · ") || "—";
+        const event = {
+          id: `${run.id}:${record.iteration}`,
+          persona,
+          run,
+          iteration: record.iteration,
+          recordedAt,
+          goal: trace.persona_goal,
+          action: trace.current_action,
+          decision: trace.decision,
+          nextAction: trace.next_action,
+        };
+        groups.set(persona, [...(groups.get(persona) ?? []), event]);
+      }
+    }
+    return [...groups.entries()]
+      .map(([persona, events]) => ({
+        persona,
+        events: events.sort((left, right) => (Date.parse(left.recordedAt ?? "") || 0) - (Date.parse(right.recordedAt ?? "") || 0)),
+      }))
+      .sort((left, right) => left.persona.localeCompare(right.persona));
+  }, [buildId, rangeStart, runs]);
+  const startDrag = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0) return;
+    event.currentTarget.setPointerCapture(event.pointerId);
+    drag.current = { pointerId: event.pointerId, startX: event.clientX, startScroll: event.currentTarget.scrollLeft, moved: false };
+  };
+  const moveDrag = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const active = drag.current;
+    if (!active || active.pointerId !== event.pointerId) return;
+    const distance = event.clientX - active.startX;
+    if (Math.abs(distance) > 4) active.moved = true;
+    event.currentTarget.scrollLeft = active.startScroll - distance;
+  };
+  const endDrag = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (drag.current?.pointerId === event.pointerId) event.currentTarget.releasePointerCapture(event.pointerId);
+  };
+  return <section className="panel persona-journeys">
+    <h3><SectionInfo title={t.personaJourneys} description={t.personaJourneysHint} /></h3>
+    <p className="hint">{t.personaJourneysHint}</p>
+    {lanes.length ? <div className="persona-journeys__lanes">
+      {lanes.map((lane) => <section className="persona-journeys__lane" key={lane.persona}>
+        <header><strong>{lane.persona}</strong><small>{lane.events.length}</small></header>
+        <div className="persona-journeys__events" onPointerDown={startDrag} onPointerMove={moveDrag} onPointerUp={endDrag} onPointerCancel={endDrag} onClickCapture={(event) => {
+          if (!drag.current?.moved) return;
+          event.preventDefault();
+          event.stopPropagation();
+          drag.current = null;
+        }}>
+          {lane.events.map((event) => <button className="persona-journeys__event" key={event.id} onClick={() => onSelect(event.run)}>
+            <time>{compactTimestamp(locale, event.recordedAt)}</time>
+            <small>{t.run} {event.run.id} · {t.iteration} #{event.iteration}</small>
+            <dl>
+              {event.goal && <div><dt>{t.personaGoal}</dt><dd>{event.goal}</dd></div>}
+              {event.action && <div><dt>{t.currentAction}</dt><dd>{event.action}</dd></div>}
+              {event.decision && <div><dt>{t.currentDecision}</dt><dd>{event.decision}</dd></div>}
+              {event.nextAction && <div><dt>{t.nextAction}</dt><dd>{event.nextAction}</dd></div>}
+            </dl>
+          </button>)}
+        </div>
+      </section>)}
+    </div> : <p className="catalog-empty">{t.noPersonaJourneys}</p>}
+  </section>;
+}
 function Card({
   title,
   description,
@@ -240,8 +445,8 @@ export function Trends({ t }: { t: (typeof copy)["en"] }) {
               <Legend />
               <Bar
                 yAxisId="count"
-                dataKey="accepted_count"
-                name={t.accepted}
+                dataKey="acceptable_count"
+                name={t.acceptable}
                 fill="#79c99e"
               />
               <Line
@@ -268,7 +473,7 @@ export function Trends({ t }: { t: (typeof copy)["en"] }) {
               <ChartTooltip />
               <Legend />
               <Bar stackId="a" dataKey="proposed" name={t.proposed} fill="#f1d292" />
-              <Bar stackId="a" dataKey="adopted" name={t.adopted} fill="#79c99e" />
+              <Bar stackId="a" dataKey="acceptable" name={t.acceptable} fill="#79c99e" />
               <Bar stackId="a" dataKey="rejected" name={t.rejected} fill="#eaa89f" />
             </BarChart>
           </ResponsiveContainer>
@@ -337,89 +542,21 @@ export function Trends({ t }: { t: (typeof copy)["en"] }) {
   );
 }
 
-function SavedDataFiles({
-  files,
-  t,
-}: {
-  files: SavedDataFile[];
-  t: (typeof copy)["en"];
-}) {
-  const [copied, setCopied] = useState<string | null>(null);
-  const displayedFiles = [...new Map(files.map((file) => [file.path, file])).values()];
-  if (!displayedFiles.length) return null;
-  const copyValue = async (value: string, key: string) => {
-    try {
-      await navigator.clipboard.writeText(value);
-      setCopied(key);
-      window.setTimeout(
-        () => setCopied((current) => (current === key ? null : current)),
-        1_500,
-      );
-    } catch {
-      setCopied(null);
-    }
-  };
-  return (
-    <section className="saved-data-files">
-      <strong>{t.savedDataFiles}</strong>
-      <div className="saved-data-files__list">
-        {displayedFiles.map((file, index) => (
-          <article key={`${file.path}-${index}`}>
-            <strong>{file.label || file.filename}</strong>
-            {file.label && (
-              <small>
-                {t.fileName}: {file.filename}
-              </small>
-            )}
-            <div>
-              <code>{file.path}</code>
-              <button
-                className="ghost icon-button"
-                type="button"
-                onClick={() => copyValue(file.path, `path-${index}`)}
-                aria-label={t.copyPath}
-                title={t.copyPath}
-              >
-                {copied === `path-${index}` ? <Check size={14} /> : <Copy size={14} />}
-              </button>
-            </div>
-            <button
-              className="ghost saved-data-files__copy-name"
-              type="button"
-              onClick={() => copyValue(file.filename, `name-${index}`)}
-            >
-              {copied === `name-${index}` ? <Check size={14} /> : <Copy size={14} />}
-              {t.copyFileName}
-            </button>
-          </article>
-        ))}
-      </div>
-    </section>
-  );
-}
-
-function iterationDataFiles(items: ProposalLifecycle[]): SavedDataFile[] {
-  return [
-    ...new Map(
-      items
-        .flatMap((item) => item.data_files ?? [])
-        .map((file) => [file.path, file]),
-    ).values(),
-  ];
-}
-
 function ProposalHistory({
   t,
   locale,
   buildId,
+  hours,
 }: {
   t: (typeof copy)["en"];
   locale: Locale;
   buildId?: string;
+  hours: number;
 }) {
   const [items, setItems] = useState<ProposalLifecycle[]>([]),
     [iterationData, setIterationData] = useState<ImprovementIterationData[]>([]),
-    [selected, setSelected] = useState<ProposalLifecycle | null>(null);
+    [selected, setSelected] = useState<ProposalLifecycle | null>(null),
+    [rangeStart] = useState(() => hours ? Date.now() - hours * 60 * 60 * 1000 : 0);
   useEffect(() => {
     api<ProposalLifecycle[]>("/api/v1/improvements/proposals")
       .then(setItems)
@@ -470,7 +607,8 @@ function ProposalHistory({
       builds.set(resolvedBuildId, build);
       return group;
     };
-    for (const item of items.filter((item) => !buildId || item.build_id === buildId)) {
+    const inRange = (value?: string) => rangeStart === 0 || !value || (Date.parse(value) || 0) >= rangeStart;
+    for (const item of items.filter((item) => (!buildId || item.build_id === buildId) && inRange(item.recorded_at))) {
       iteration(
         item.build_id,
         item.build_name,
@@ -480,7 +618,7 @@ function ProposalHistory({
       ).items.push(item);
     }
     for (const item of iterationData.filter(
-      (item) => !buildId || item.build_id === buildId,
+      (item) => (!buildId || item.build_id === buildId) && inRange(item.recorded_at),
     )) {
       iteration(
         item.build_id,
@@ -507,9 +645,11 @@ function ProposalHistory({
               ?.recordedAt?.localeCompare(a.iterations.at(-1)?.recordedAt || "") || 0,
         ),
     }));
-  }, [items, iterationData, buildId]);
+  }, [items, iterationData, buildId, rangeStart]);
   const statusLabel = (value: string) =>
-    value === "rejected"
+    value === "acceptable"
+      ? t.acceptable
+      : value === "rejected"
       ? t.rejected
       : value === "proposed"
         ? t.proposed
@@ -518,8 +658,29 @@ function ProposalHistory({
     typeof selected?.proposal[key] === "string"
       ? String(selected.proposal[key])
       : "";
+  const proposalItem = (item: ProposalLifecycle) => (
+    <button
+      className="proposal-tree__item"
+      key={item.proposal_id}
+      onClick={() => setSelected(item)}
+    >
+      <span>
+        <strong>{item.title}</strong>
+        <small>{item.target}</small>
+      </span>
+      <span className="proposal-tree__item-meta">
+        {item.score !== undefined && item.score !== null && (
+          <b className="proposal-tree__score">
+            {t.score} {item.score}/10
+          </b>
+        )}
+        <StatusBadge value={item.status} label={statusLabel(item.status)} />
+      </span>
+    </button>
+  );
+  const evidenceCopy = localeMessages<Record<string, string>>(locale, "evaluations");
   return (
-    <section className="cycle-proposal-history">
+    <section className="panel cycle-proposal-history">
       <h3>
         <SectionInfo title={t.history} description={t.historyHint} />
       </h3>
@@ -542,8 +703,21 @@ function ProposalHistory({
                       <small>{run.runId}</small>
                     </span>
                   </summary>
-                  {run.iterations.map((group) => (
-                    <details
+                  {run.iterations.map((group) => {
+                    const personaGroups = new Map<string, { personas: string[]; items: ProposalLifecycle[] }>();
+                    const ungroupedItems: ProposalLifecycle[] = [];
+                    for (const item of group.items) {
+                      const personas = [...new Set((item.personas ?? []).filter((persona) => persona.trim()))];
+                      if (!personas.length) {
+                        ungroupedItems.push(item);
+                        continue;
+                      }
+                      const key = personas.join("\u0000");
+                      const personaGroup = personaGroups.get(key) || { personas, items: [] };
+                      personaGroup.items.push(item);
+                      personaGroups.set(key, personaGroup);
+                    }
+                    return <details
                       className="proposal-tree__iteration"
                       key={group.iteration}
                       open
@@ -551,51 +725,41 @@ function ProposalHistory({
                       <summary>
                         <span>
                           <strong>
-                            {t.iteration} #{group.iteration}
+                            {t.iteration} #{group.iteration} <span className="proposal-tree__count">({group.items.length})</span>
                           </strong>
                           <small>
                             {timestamp(locale, group.recordedAt)}
                           </small>
                         </span>
                         <span className="proposal-tree__iteration-meta">
-                          <small>{group.items.length}</small>
+                          <EvidenceViewer
+                            className="proposal-tree__evidence"
+                            runId={run.runId}
+                            iteration={group.iteration}
+                            artifacts={visualEvidenceArtifacts([...group.dataFiles, ...group.items.flatMap((item) => item.data_files ?? [])])}
+                            imageLabel={evidenceCopy.viewImageEvidence}
+                            htmlLabel={evidenceCopy.viewHtmlEvidence}
+                            imageTitle={evidenceCopy.imageEvidence}
+                            htmlTitle={evidenceCopy.htmlEvidence}
+                          />
                         </span>
                       </summary>
                       <div>
-                        {group.items.map((item) => (
-                          <button
-                            className="proposal-tree__item"
-                            key={item.proposal_id}
-                            onClick={() => setSelected(item)}
+                        {[...personaGroups.values()].map((personaGroup) => (
+                          <section
+                            className="proposal-tree__persona-group"
+                            key={personaGroup.personas.join("\u0000")}
                           >
-                            <span>
-                              <strong>{item.title}</strong>
-                              <small>{item.target}</small>
-                            </span>
-                            <span className="proposal-tree__item-meta">
-                              {item.score !== undefined &&
-                                item.score !== null && (
-                                  <b className="proposal-tree__score">
-                                    {t.score} {item.score}/10
-                                  </b>
-                                )}
-                              <StatusBadge
-                                value={item.status}
-                                label={statusLabel(item.status)}
-                              />
-                            </span>
-                          </button>
+                            <header>
+                              <strong>{personaGroup.personas.join(" · ")}</strong>
+                            </header>
+                            <div>{personaGroup.items.map(proposalItem)}</div>
+                          </section>
                         ))}
-                        <SavedDataFiles
-                          files={[
-                            ...group.dataFiles,
-                            ...iterationDataFiles(group.items),
-                          ]}
-                          t={t}
-                        />
+                        {ungroupedItems.map(proposalItem)}
                       </div>
                     </details>
-                  ))}
+                  })}
                 </details>
               ))}
             </details>
@@ -675,21 +839,23 @@ function ProposalHistory({
 function CycleImprovementAI({
   locale,
   build,
+  hours,
 }: {
   locale: Locale;
   build: string;
+  hours: number;
 }) {
   const [data, setData] = useState<ImprovementAnalytics>(),
     [analysis, setAnalysis] = useState(""),
     [loading, setLoading] = useState(false),
     t = locales[locale].cycle;
   useEffect(() => {
-    api<ImprovementAnalytics>("/api/improvement-analytics?hours=720")
+    api<ImprovementAnalytics>(`/api/improvement-analytics?hours=${hours}`)
       .then((next) => {
         setData(next);
       })
       .catch(() => setData(undefined));
-  }, []);
+  }, [hours]);
   const trend = data?.iteration_trends.find((item) => item.build_id === build),
     scores = (trend?.points ?? [])
       .map((item) => item.score)
@@ -707,6 +873,7 @@ function CycleImprovementAI({
     api<{ response: string }>("/api/cycle-improvements/analyze", "POST", {
       build_id: build,
       locale,
+      hours,
     })
       .then((result) => setAnalysis(result.response))
       .catch((error) => setAnalysis(error.message))
@@ -757,18 +924,105 @@ function CycleImprovementAI({
               </div>
             )}
           </div>
-          <ProposalHistory t={copy[locale]} locale={locale} buildId={build} />
         </>
       )}
     </section>
   );
 }
-export function ImprovementsPage() {
+
+function StoredState({
+  buildId,
+  locale,
+  t,
+}: {
+  buildId: string;
+  locale: Locale;
+  t: (typeof copy)["en"];
+}) {
+  const [states, setStates] = useState<RunnerState[]>([]);
+  useEffect(() => {
+    api<RunnerState[]>(`/api/builds/${encodeURIComponent(buildId)}/state`)
+      .then(setStates)
+      .catch(() => setStates([]));
+  }, [buildId]);
+  const renderStateValue = (value: unknown, label?: string): ReactNode => {
+    if (Array.isArray(value)) {
+      return <details className="stored-state__tree-node" open={label === "journey_handoff"}><summary>{label ?? "Array"}<small>{value.length} items</small></summary><ul>{value.map((item, index) => <li key={index}>{renderStateValue(item, String(index))}</li>)}</ul></details>;
+    }
+    if (value && typeof value === "object") {
+      return <details className="stored-state__tree-node" open={label === "journey_handoff"}><summary>{label ?? "Object"}<small>{Object.keys(value as Record<string, unknown>).length} fields</small></summary><ul>{Object.entries(value as Record<string, unknown>).map(([key, item]) => <li key={key}>{renderStateValue(item, key)}</li>)}</ul></details>;
+    }
+    return <span className="stored-state__tree-leaf"><strong>{label}</strong><code>{value === null ? "null" : String(value)}</code></span>;
+  };
+  return (
+    <section className="panel stored-state">
+      <PanelHeader title={t.storedState} description={t.storedStateHint} />
+      {states.length ? (
+        <div className="stored-state__list">
+          {states.map((state) => {
+            const personas =
+              state.value && typeof state.value === "object" && !Array.isArray(state.value)
+                ? (state.value as { personas?: Record<string, unknown> }).personas
+                : undefined;
+            return (
+              <article key={state.name}>
+                <header>
+                  <span className="stored-state__name">
+                    <strong>{state.name}</strong>
+                    <em>{state.scope === "build" ? t.buildState : `${t.runnerState}: ${state.runner_id ?? "—"}`}</em>
+                  </span>
+                  <small>{t.updated} {timestamp(locale, state.updated_at)}</small>
+                </header>
+                {personas && Object.keys(personas).length > 0 && (
+                  <div className="stored-state__personas">
+                    {Object.entries(personas).map(([persona, value]) => {
+                      const record = value && typeof value === "object" && !Array.isArray(value)
+                        ? value as Record<string, unknown>
+                        : {};
+                      return (
+                        <details className="stored-state__persona" key={persona}>
+                          <summary><strong>{persona}</strong><span>{String(record.last_action_at ?? "—")}</span><span>{String(record.active ?? "—")}</span></summary>
+                          <div className="stored-state__tree"><ul className="stored-state__tree-root">{Object.entries(record).map(([key, item]) => <li key={key}>{renderStateValue(item, key)}</li>)}</ul></div>
+                        </details>
+                      );
+                    })}
+                  </div>
+                )}
+                <details>
+                  <summary>{t.rawState}</summary>
+                  <pre>{JSON.stringify(state.value, null, 2)}</pre>
+                </details>
+              </article>
+            );
+          })}
+        </div>
+      ) : (
+        <p className="catalog-empty">{t.noStoredState}</p>
+      )}
+    </section>
+  );
+}
+export function ImprovementsPage({
+  runs,
+  onStop,
+  onRetry,
+  onApprove,
+  onReject,
+}: {
+  runs: Run[];
+  onStop: (id: string) => void;
+  onRetry: (id: string, restartFromFirst: boolean) => void;
+  onApprove: (id: string) => void;
+  onReject: (id: string) => void;
+}) {
   const locale = resolveLocale(localStorage.getItem("orbit.locale")),
     t = copy[locale],
     [build, setBuild] = useState(""),
     [builds, setBuilds] = useState<Build[]>([]),
-    [initialLoading, setInitialLoading] = useState(true);
+    [initialLoading, setInitialLoading] = useState(true),
+    [selectedRun, setSelectedRun] = useState<Run | null>(null),
+    [retryingRun, setRetryingRun] = useState<Run | null>(null),
+    [hours, setHours] = useState(24);
   useEffect(() => {
     api<Build[]>("/api/builds")
       .then((next) => {
@@ -777,6 +1031,7 @@ export function ImprovementsPage() {
           current ||
           [...next].sort(
             (left, right) =>
+              Number(right.starred) - Number(left.starred) ||
               lastRunTimestamp(right) - lastRunTimestamp(left) ||
               left.name.localeCompare(right.name),
           )[0]?.id ||
@@ -789,13 +1044,22 @@ export function ImprovementsPage() {
   const sortedBuilds = useMemo(
     () =>
       [...builds].sort((left, right) => {
+        const starOrder = Number(right.starred) - Number(left.starred);
+        if (starOrder) return starOrder;
         const leftRun = lastRunTimestamp(left);
         const rightRun = lastRunTimestamp(right);
         return rightRun - leftRun || left.name.localeCompare(right.name);
       }),
     [builds],
   );
-  if (initialLoading) return <><SectionSkeleton rows={1} /><SectionSkeleton rows={4} /><SectionSkeleton rows={3} /></>;
+  if (initialLoading) return <>
+    <SectionSkeleton rows={1} />
+    <SectionSkeleton rows={3} />
+    <SectionSkeleton rows={3} />
+    <SectionSkeleton rows={4} />
+    <SectionSkeleton rows={4} />
+    <SectionSkeleton rows={3} />
+  </>;
   return (
     <>
       <section className="improvements-build-selector">
@@ -804,14 +1068,60 @@ export function ImprovementsPage() {
           <select value={build} onChange={(event) => setBuild(event.target.value)}>
             {sortedBuilds.map((item) => (
               <option key={item.id} value={item.id}>
-                {item.name} ({compactTimestamp(locale, item.last_run_at)})
+                {item.starred ? "★ " : ""}{item.name} ({compactTimestamp(locale, item.last_run_at)})
               </option>
             ))}
           </select>
         </label>
+        <label>
+          {t.range}
+          <select value={hours} onChange={(event) => setHours(Number(event.target.value))}>
+            <option value={24}>24h</option>
+            <option value={72}>3d</option>
+            <option value={168}>7d</option>
+            <option value={720}>30d</option>
+            <option value={0}>{t.unlimited}</option>
+          </select>
+        </label>
       </section>
-      {build && <FeedbackTrends locale={locale} buildId={build} scope="improvements" />}
-      <CycleImprovementAI locale={locale} build={build} />
+      <CycleImprovementAI locale={locale} build={build} hours={hours} />
+      {build && <FeedbackTrends locale={locale} buildId={build} scope="improvements" hours={hours} onHoursChange={setHours} />}
+      {build && <RelatedRuns
+        key={`${build}:${hours}`}
+        buildId={build}
+        runs={runs}
+        locale={locale}
+        t={t}
+        hours={hours}
+        onStop={onStop}
+        onRetryRequest={setRetryingRun}
+        onSelect={setSelectedRun}
+      />}
+      {build && <PersonaJourneyTimeline key={`${build}:${hours}`} buildId={build} runs={runs} locale={locale} t={t} hours={hours} onSelect={setSelectedRun} />}
+      {build && <ProposalHistory key={`${build}:${hours}`} t={t} locale={locale} buildId={build} hours={hours} />}
+      {build && <StoredState buildId={build} locale={locale} t={t} />}
+      {selectedRun && <EvaluationsPage
+        detailOnly
+        locale={locale}
+        runs={runs}
+        initialSelectedRun={selectedRun}
+        onSelectedRunClose={() => setSelectedRun(null)}
+        onStop={onStop}
+        onRetry={onRetry}
+        onApprove={onApprove}
+        onReject={onReject}
+        onEmergencyStop={() => undefined}
+        onDeleteRuns={() => Promise.resolve()}
+      />}
+      <Modal open={Boolean(retryingRun)} title={t.retry} onClose={() => setRetryingRun(null)} className="modal--confirm">
+        <div className="modal-form retry-confirmation">
+          <p className="confirm-description">{t.retryWarning}</p>
+          <div className="modal-actions">
+            <button className="reject" onClick={() => { if (retryingRun) onRetry(retryingRun.id, false); setRetryingRun(null); }}>{t.resume}</button>
+            <button className="approve" onClick={() => { if (retryingRun) onRetry(retryingRun.id, true); setRetryingRun(null); }}>{t.restart}</button>
+          </div>
+        </div>
+      </Modal>
     </>
   );
 }

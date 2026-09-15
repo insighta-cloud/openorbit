@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Literal
 
-from fastapi import FastAPI, HTTPException, Query, Response, WebSocket
+from fastapi import FastAPI, HTTPException, Query, Request, Response, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
@@ -80,6 +81,30 @@ def safely(action):
         raise HTTPException(409, str(error))
 
 
+_LOCALE_PATTERN = re.compile(r"^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$")
+
+
+def request_locale(request: Request) -> str | None:
+    """Return the browser's highest-priority valid ``Accept-Language`` locale."""
+    choices: list[tuple[float, int, str]] = []
+    for index, item in enumerate(request.headers.get("accept-language", "").split(",")):
+        value, *parameters = item.strip().split(";")
+        if not _LOCALE_PATTERN.fullmatch(value):
+            continue
+        quality = 1.0
+        for parameter in parameters:
+            name, separator, raw_value = parameter.strip().partition("=")
+            if name.lower() != "q" or not separator:
+                continue
+            try:
+                quality = float(raw_value)
+            except ValueError:
+                quality = 0.0
+        if quality > 0:
+            choices.append((quality, index, value))
+    return max(choices, default=(0.0, 0, ""), key=lambda item: (item[0], -item[1]))[2] or None
+
+
 def paginated(values: list, response: Response, page: int, per_page: int) -> list:
     """Use GitLab-compatible pagination headers for collection endpoints."""
     total = len(values)
@@ -152,7 +177,7 @@ def runs():
         ]
         item["proposed_improvements"] = len(improvements)
         item["approved_improvements"] = sum(
-            improvement.get("status") == "adopted" for improvement in improvements
+            improvement.get("status") in {"adopted", "accepted"} for improvement in improvements
         )
         item["reported_issues"] = len(issues)
         values.append(item)
@@ -202,6 +227,11 @@ def dashboard():
 @app.get("/api/builds")
 def builds():
     return store.builds()
+
+
+@app.get("/api/builds/{build_id}/state")
+def build_state(build_id: str):
+    return safely(lambda: store.build_state(build_id))
 
 
 @app.get("/api/prompt-templates")
@@ -348,14 +378,28 @@ def workspaces(path: str | None = None):
     return safely(lambda: store.workspaces(path))
 
 
+class BuildRunRequest(BaseModel):
+    output_locale: str = Field(default="", max_length=35, pattern=r"^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$")
+
+
 @app.post("/api/builds/{build_id}/runs")
-def invoke_build(build_id: str):
-    return safely(lambda: store.invoke_remote_build(build_id))
+def invoke_build(build_id: str, request: Request, values: BuildRunRequest | None = None):
+    return safely(
+        lambda: store.invoke_remote_build(
+            build_id,
+            output_locale=(request_locale(request) or (values.output_locale if values else None)),
+        )
+    )
 
 
 @app.post("/api/builds/{build_id}/tests")
-def test_build(build_id: str):
-    return safely(lambda: store.test_build(build_id))
+def test_build(build_id: str, request: Request, values: BuildRunRequest | None = None):
+    return safely(
+        lambda: store.test_build(
+            build_id,
+            output_locale=(request_locale(request) or (values.output_locale if values else None)),
+        )
+    )
 
 
 @app.get("/api/build-tests/{session_id}")
@@ -407,6 +451,10 @@ class BuildCreate(BaseModel):
     enabled: bool = True
 
 
+class BuildStarUpdate(BaseModel):
+    starred: bool
+
+
 class PipelineCreate(BaseModel):
     """The requested execution mode for a project pipeline."""
 
@@ -417,16 +465,31 @@ class PipelineAction(BaseModel):
     action: Literal["approve", "reject", "cancel"]
 
 
+class IssueManagementUpdate(BaseModel):
+    status: Literal["unreviewed", "reviewing", "in_progress", "resolved", "deferred"] | None = None
+    comment: str = Field(default="", max_length=4_000)
+    assigner: str = Field(default="", max_length=120)
+    verification_run_id: str = Field(default="", max_length=128)
+
+
+class IssueManagementDelete(BaseModel):
+    proposal_ids: list[str] = Field(min_length=1, max_length=200)
+
+
 class RunnerAssetUpdate(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     description: str = Field(min_length=1, max_length=500)
-    source: str = Field(min_length=1, max_length=100_000)
+    source: str = Field(min_length=1, max_length=250_000)
     template_id: str | None = Field(default=None, max_length=64)
 
 
 class RunnerAssetCreate(RunnerAssetUpdate):
     id: str = Field(pattern=r"^[a-z][a-z0-9-]{2,63}$")
     template_id: str = Field(default="custom", max_length=64)
+
+
+class RunnerGraphPreview(BaseModel):
+    source: str = Field(min_length=1, max_length=100_000)
 
 
 class RunnerTemplateValues(BaseModel):
@@ -490,6 +553,11 @@ def runners():
     return store.runners()
 
 
+@app.post("/api/runners/preview-graph")
+def preview_runner_graph(values: RunnerGraphPreview):
+    return safely(lambda: store.preview_runner_graph(values.source))
+
+
 @app.post("/api/runners")
 def create_runner(values: RunnerAssetCreate):
     return safely(lambda: store.create_runner(values.model_dump()))
@@ -518,6 +586,11 @@ def create_build(values: BuildCreate):
 @app.put("/api/builds/{build_id}")
 def update_build(build_id: str, values: BuildCreate):
     return safely(lambda: store.update_build(build_id, values.model_dump()))
+
+
+@app.patch("/api/builds/{build_id}/star")
+def update_build_star(build_id: str, values: BuildStarUpdate):
+    return safely(lambda: store.set_build_star(build_id, values.starred))
 
 
 @app.delete("/api/builds/{build_id}")
@@ -609,8 +682,10 @@ def list_project_pipelines(
     status_code=201,
     summary="Start a project pipeline",
 )
-def create_project_pipeline(project_id: str, values: PipelineCreate):
-    return safely(lambda: store.invoke_remote_build(project_id, values.execution_mode))
+def create_project_pipeline(project_id: str, values: PipelineCreate, request: Request):
+    return safely(
+        lambda: store.invoke_remote_build(project_id, values.execution_mode, request_locale(request))
+    )
 
 
 @app.get("/api/v1/quick-starts", tags=["Quick starts"], operation_id="listQuickStarts")
@@ -974,19 +1049,20 @@ def template_translation_v1(values: TemplateTranslationRequest):
 
 class CycleAnalysisRequest(BaseModel):
     build_id: str = Field(min_length=1, max_length=200)
+    hours: int = Field(default=720, ge=0, le=8760)
     locale: str | None = Field(
         default=None, min_length=2, max_length=35, pattern=r"^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$"
     )
 
 
 @app.post("/api/cycle-improvements/analyze")
-def analyze_cycle(values: CycleAnalysisRequest):
+def analyze_cycle(values: CycleAnalysisRequest, request: Request):
     """Use the configured system AI to diagnose a build's PDCA loop."""
     profile_name = store.application_settings()["chat_model_profile_name"]
     if not profile_name:
         raise HTTPException(409, "Select a System AI model in Settings first.")
     configured = profile(store.profiles(), profile_name)
-    analytics = store.improvement_analytics(720)
+    analytics = store.improvement_analytics(values.hours)
     trend = next(
         (item for item in analytics["iteration_trends"] if item["build_id"] == values.build_id),
         None,
@@ -1013,7 +1089,11 @@ def analyze_cycle(values: CycleAnalysisRequest):
         "not a single iteration. Identify evidence of plan, do, check, and act; score trends, "
         "repeated proposals, and whether accepted work was verified. Recommend only operating-cycle "
         "changes (runner, workflow, tests, supervisor prompt, or cadence). Respond only in "
-        + (f"Use BCP 47 locale '{values.locale}'. " if values.locale else "")
+        + (
+            f"Use BCP 47 locale '{request_locale(request) or values.locale}'. "
+            if request_locale(request) or values.locale
+            else ""
+        )
         + "Respond in concise Markdown with headings for Health, Evidence, Bottleneck, and Recommended next action.\n\n"
         + json.dumps(context, ensure_ascii=False, default=str)
     )
@@ -1026,7 +1106,7 @@ def analyze_cycle(values: CycleAnalysisRequest):
 
 
 @app.post("/api/chat")
-def chat(values: ChatMessage):
+def chat(values: ChatMessage, request: Request):
     profile_name = store.application_settings()["chat_model_profile_name"]
     if not profile_name:
         raise HTTPException(409, "Select an AI model profile for the chat assistant in Settings.")
@@ -1040,6 +1120,8 @@ def chat(values: ChatMessage):
             "The local OpenAPI contract is available at /api/openapi.json; use it as the source of truth "
             "when explaining API endpoints, parameters, and response shapes.\n"
         )
+        if locale := request_locale(request):
+            prompt += f"Respond in BCP 47 locale '{locale}'.\n"
         if history:
             prompt += f"Conversation so far:\n{history}\n\n"
         prompt += f"User: {values.content}\nAssistant:"
@@ -1196,7 +1278,7 @@ def list_improvements_v1():
 )
 def list_proposal_lifecycles_v1(
     build_id: str | None = None,
-    status: Literal["proposed", "accepted", "rejected", "applied"] | None = None,
+    status: Literal["proposed", "acceptable", "accepted", "rejected", "applied"] | None = None,
 ):
     return store.proposal_lifecycles(build_id, status)
 
@@ -1211,8 +1293,25 @@ def list_improvement_iteration_data_v1(build_id: str | None = None):
     return store.improvement_iteration_data(build_id)
 
 
+@app.get("/api/v1/issue-management", tags=["Improvements"], operation_id="listIssueManagementItems")
+def list_issue_management_items_v1():
+    return store.issue_management_items()
+
+
+@app.patch(
+    "/api/v1/issue-management/{proposal_id}", tags=["Improvements"], operation_id="updateIssueManagementItem"
+)
+def update_issue_management_item_v1(proposal_id: str, values: IssueManagementUpdate):
+    return safely(lambda: store.update_issue_management_item(proposal_id, **values.model_dump()))
+
+
+@app.delete("/api/v1/issue-management", tags=["Improvements"], operation_id="deleteIssueManagementItems")
+def delete_issue_management_items_v1(values: IssueManagementDelete):
+    return safely(lambda: store.delete_issue_management_items(values.proposal_ids))
+
+
 @app.get("/api/v1/improvements/analytics", tags=["Improvements"], operation_id="getImprovementAnalytics")
-def improvement_analytics_v1(hours: int = Query(default=24, ge=1, le=720)):
+def improvement_analytics_v1(hours: int = Query(default=24, ge=0, le=720)):
     return store.improvement_analytics(hours)
 
 
