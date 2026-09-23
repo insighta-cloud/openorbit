@@ -8,7 +8,7 @@ from orbit_sdk import graph, runner
 graph.connect("validate", "plan")
 graph.connect("plan", "exercise", kind="data", label="focused journey")
 graph.connect("exercise", "retain")
-graph.connect("retain", "plan", kind="loop", label="next iteration")
+graph.connect("close-journey-cycle", "plan", kind="loop", label="next iteration")
 
 
 def state_path(ctx):

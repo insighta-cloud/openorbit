@@ -1,6 +1,7 @@
 import { Background, BaseEdge, Controls, EdgeLabelRenderer, Handle, MarkerType, Position, ReactFlow, type EdgeProps, type Node, type NodeProps } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import { createContext, useCallback, useContext, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { WorkflowNodeCard } from "./workflow-node-card";
 
 export type WorkflowGraphNode = { id: string; title: string; phase?: string | null; inputs?: string[]; outputs?: string[]; description?: string | null; status?: "idle" | "running" | "succeeded" | "failed" | "skipped" };
 export type WorkflowGraphEdge = { source: string; target: string; kind?: "execution" | "data" | "condition" | "loop" | "error"; label?: string | null; source_port?: string | null; target_port?: string | null };
@@ -8,7 +9,7 @@ type GraphNodeData = WorkflowGraphNode;
 type GraphZoneData = { title: string; annotation: string };
 type NodeSize = { width: number; height: number };
 type Measurements = { key: string; sizes: Record<string, NodeSize> };
-const lifecyclePhases = ["before_all", "before_each", "execute", "verify", "after_each", "after_all"];
+const lifecyclePhases = ["before_all", "before_each", "execute", "verify", "after_supervision", "after_each", "after_all"];
 const NodeMeasurementContext = createContext<(id: string, size: NodeSize) => void>(() => undefined);
 function LoopEdge({ sourceX, sourceY, targetX, targetY, label, labelStyle, markerEnd, style }: EdgeProps) {
   const routeY = Math.min(sourceY, targetY) - 160;
@@ -29,7 +30,7 @@ function OrbitNode({ id, data }: NodeProps<Node<GraphNodeData>>) {
     observer.observe(node);
     return () => observer.disconnect();
   }, [id, reportSize]);
-  return <div ref={element} className={`workflow-graph-node workflow-graph-node--${data.status ?? "idle"}`}><Handle type="target" position={Position.Left} /><header style={{ margin: 0 }}><small>Function</small><strong>{data.title}</strong></header>{data.description && <p>{data.description}</p>}<footer style={{ margin: 0 }}>{data.inputs?.map((port) => <span key={port}>← {port}</span>)}{data.outputs?.map((port) => <span key={port}>{port} →</span>)}</footer><Handle type="source" position={Position.Right} /></div>;
+  return <WorkflowNodeCard ref={element} className={`workflow-graph-node workflow-graph-node--${data.status ?? "idle"}`} title={data.title} inputs={data.inputs} outputs={data.outputs} description={data.description} leading={<Handle type="target" position={Position.Left} />} trailing={<Handle type="source" position={Position.Right} />} />;
 }
 const nodeTypes = {
   orbit: OrbitNode,
