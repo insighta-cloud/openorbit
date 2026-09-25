@@ -218,14 +218,14 @@ export default function App() {
     });
   };
   const invoke = (id: string) =>
-    api(`/api/builds/${id}/runs`, "POST", { output_locale: locale })
+    api(`/api/builds/${id}/runs`, "POST")
       .then(() => {
         room.setNotice(ui.evaluationStarted, "success");
         room.refresh();
       })
       .catch((e) => room.setNotice(e.message));
   const testBuild = (id: string) =>
-    api<Run>(`/api/builds/${id}/tests`, "POST", { output_locale: locale })
+    api<Run>(`/api/builds/${id}/tests`, "POST")
       .then((run) => {
         room.setNotice(ui.evaluationTestStarted, "success");
         return run;
@@ -426,7 +426,7 @@ export default function App() {
       }
     >
      <Suspense fallback={<SectionSkeleton rows={6} />}>
-  <div className="page-stack">{content}</div>
+  <div className="page-stack" key={page}>{content}</div>
 </Suspense>
       <QuickStartModal
         key={`${quickStartOpen}:${quickStartSelection ?? ""}`}
